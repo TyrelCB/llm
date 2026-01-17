@@ -42,14 +42,59 @@ class LocalLLM:
         "i don't have access",
     ]
 
-    def __init__(self) -> None:
-        """Initialize the local LLM."""
+    def __init__(self, model: str | None = None) -> None:
+        """Initialize the local LLM.
+
+        Args:
+            model: Model name to use. Defaults to settings.ollama_model.
+        """
+        self._model = model or settings.ollama_model
         self._llm = ChatOllama(
             base_url=settings.ollama_base_url,
-            model=settings.ollama_model,
+            model=self._model,
             temperature=0.7,
         )
-        self._model = settings.ollama_model
+
+    def set_model(self, model_name: str) -> None:
+        """Switch to a different Ollama model.
+
+        Args:
+            model_name: Name of the model to use (e.g., 'mistral:7b', 'deepseek-r1:7b')
+        """
+        logger.info(f"Switching model from {self._model} to {model_name}")
+        self._model = model_name
+        self._llm = ChatOllama(
+            base_url=settings.ollama_base_url,
+            model=model_name,
+            temperature=0.7,
+        )
+
+    def get_model(self) -> str:
+        """Get the current model name."""
+        return self._model
+
+    @staticmethod
+    def list_available_models() -> list[str]:
+        """List all available Ollama models.
+
+        Returns:
+            List of model names installed in Ollama.
+        """
+        try:
+            response = httpx.get(
+                f"{settings.ollama_base_url}/api/tags",
+                timeout=5.0,
+            )
+            if response.status_code != 200:
+                logger.warning(f"Failed to list models: HTTP {response.status_code}")
+                return []
+
+            data = response.json()
+            return [m["name"] for m in data.get("models", [])]
+
+        except Exception as e:
+            logger.warning(f"Failed to list Ollama models: {e}")
+            return []
 
     @staticmethod
     def check_availability() -> bool:
@@ -117,7 +162,7 @@ class LocalLLM:
         if temperature is not None:
             llm = ChatOllama(
                 base_url=settings.ollama_base_url,
-                model=settings.ollama_model,
+                model=self._model,
                 temperature=temperature,
             )
         else:

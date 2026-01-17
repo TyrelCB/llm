@@ -1,7 +1,6 @@
 """Workflow node implementations for LangGraph."""
 
 import logging
-import re
 from typing import Any
 
 from langchain_core.documents import Document
@@ -26,9 +25,17 @@ _updater = KnowledgeBaseUpdater(_vectorstore)
 ROUTER_SYSTEM_PROMPT = """You are a query router. Analyze the user's query and decide the best action.
 
 Respond with ONLY one of these exact words:
-- "retrieve" - Query needs information from the knowledge base
-- "tool" - Query requires executing a tool/command (e.g., bash commands, file operations)
-- "generate" - Query can be answered directly without retrieval (greetings, simple questions)
+- "retrieve" - Query needs information from the knowledge base (documents, files ingested into the system)
+- "tool" - Query requires executing a system command or checking system state. Examples:
+  * Checking disk space, memory, CPU usage
+  * Listing files or directories
+  * Getting system information (OS, hostname, etc.)
+  * Running any bash/shell command
+  * File operations (reading, writing, searching files on disk)
+  * Process management
+  * Network information
+  * Any query that asks about "this system", "this machine", "my computer"
+- "generate" - Query can be answered directly from general knowledge (greetings, explanations, coding help, general questions)
 
 Do not include any other text."""
 
@@ -41,6 +48,29 @@ Given the original query and the fact that initial retrieval didn't find relevan
 3. Break down complex queries into simpler terms
 
 Respond with ONLY the rewritten query, nothing else."""
+
+
+COMMAND_GENERATOR_PROMPT = """You are a Linux command generator. Given a user's natural language request, generate the appropriate bash command(s) to fulfill it.
+
+Rules:
+1. Output ONLY the bash command(s), nothing else
+2. Use standard Linux commands that work on most distributions
+3. For multiple commands, separate them with && or ;
+4. Prefer informative output (e.g., use -h for human-readable sizes)
+5. Keep commands safe - avoid destructive operations unless explicitly requested
+6. If the request is ambiguous, choose the most common interpretation
+
+Examples:
+- "how much disk space" -> "df -h"
+- "what OS am I running" -> "uname -a && cat /etc/os-release"
+- "list files in current directory" -> "ls -la"
+- "show memory usage" -> "free -h"
+- "what processes are running" -> "ps aux | head -20"
+- "show network interfaces" -> "ip addr"
+- "what's my IP address" -> "hostname -I"
+- "show CPU info" -> "lscpu | head -20"
+
+Respond with ONLY the command, no explanations or markdown."""
 
 
 def route_query(state: AgentStateDict) -> AgentStateDict:
@@ -183,6 +213,7 @@ def generate_local(state: AgentStateDict) -> AgentStateDict:
         query=query,
         context=context if context else "No specific context available.",
         force_local=True,
+        conversation_history=messages if messages else None,
     )
 
     # Add to conversation history
@@ -214,6 +245,7 @@ def generate_fallback(state: AgentStateDict) -> AgentStateDict:
             query=query,
             context="No relevant local documents found. Please provide a comprehensive answer.",
             force_local=False,
+            conversation_history=messages if messages else None,
         )
 
         provider_used = result.provider
@@ -276,30 +308,44 @@ def update_knowledge_base(state: AgentStateDict) -> AgentStateDict:
 
 def prepare_tool_calls(state: AgentStateDict) -> AgentStateDict:
     """
-    Parse query to identify tool calls needed.
+    Use LLM to generate appropriate bash command for the user's query.
     """
     query = state["query"]
 
-    # Simple heuristic for bash tool detection
-    bash_patterns = [
-        r"run\s+(?:the\s+)?(?:command|cmd)",
-        r"execute\s+",
-        r"(?:^|\s)(?:ls|cd|cat|grep|find|mkdir|rm|cp|mv|echo|pwd)\s",
-        r"bash\s+",
-        r"shell\s+",
+    # Use LLM to generate the appropriate command
+    messages = [
+        SystemMessage(content=COMMAND_GENERATOR_PROMPT),
+        HumanMessage(content=query),
     ]
 
-    for pattern in bash_patterns:
-        if re.search(pattern, query.lower()):
-            # Extract the command (simplified)
+    try:
+        result = _selector.generate(messages, force_local=True)
+        command = result.content.strip()
+
+        # Clean up the command (remove markdown code blocks if present)
+        if command.startswith("```"):
+            lines = command.split("\n")
+            command = "\n".join(
+                line for line in lines
+                if not line.startswith("```")
+            ).strip()
+
+        # Remove any leading/trailing quotes
+        command = command.strip('"\'`')
+
+        if command:
+            logger.info(f"Generated command for query '{query}': {command}")
             tool_calls = [{
                 "tool_name": "bash",
-                "arguments": {"command": query},
+                "arguments": {"command": command},
                 "requires_approval": True,
             }]
             return {"tool_calls": tool_calls}
 
-    # No tools identified, route to generate
+    except Exception as e:
+        logger.warning(f"Command generation failed: {e}")
+
+    # Fallback to generate if command generation fails
     return {"route": RouteDecision.GENERATE.value, "tool_calls": []}
 
 
@@ -405,3 +451,11 @@ def should_update_kb(state: AgentStateDict) -> str:
     if state.get("should_update_kb", False):
         return "update_kb"
     return "end"
+
+
+def get_selector() -> ProviderSelector:
+    """Get the shared ProviderSelector instance.
+
+    This allows external code to access model switching functionality.
+    """
+    return _selector

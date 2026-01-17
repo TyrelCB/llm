@@ -225,6 +225,7 @@ class ProviderSelector:
         context: str,
         system_prompt: str | None = None,
         force_local: bool = False,
+        conversation_history: list[BaseMessage] | None = None,
     ) -> GenerationResult:
         """
         Generate a response with RAG context.
@@ -234,25 +235,39 @@ class ProviderSelector:
             context: Retrieved context
             system_prompt: Optional system prompt
             force_local: Only use local provider
+            conversation_history: Previous messages for context
 
         Returns:
             GenerationResult with response
         """
-        default_system = """You are a helpful AI assistant. Answer questions based on the provided context.
-If the context doesn't contain enough information to answer fully, say so clearly.
-Be concise but thorough in your answers."""
+        default_system = """You are a helpful AI assistant with memory of the conversation.
 
-        messages = [
-            SystemMessage(content=system_prompt or default_system),
-            HumanMessage(
-                content=f"""Context:
+Instructions:
+1. For questions about the conversation itself (e.g., "what was my last question?", "what did we discuss?"), use the conversation history above.
+2. For questions about specific topics, use the provided context documents.
+3. If the context doesn't contain enough information, say so clearly.
+4. Be concise but thorough in your answers."""
+
+        messages = [SystemMessage(content=system_prompt or default_system)]
+
+        # Add conversation history if provided
+        if conversation_history:
+            messages.extend(conversation_history)
+
+        # Add current query with context
+        context_note = ""
+        if context and context != "No specific context available.":
+            context_note = f"""
+
+Retrieved context from knowledge base:
 {context}
+"""
 
-Question: {query}
-
-Answer based on the context above:"""
-            ),
-        ]
+        messages.append(
+            HumanMessage(content=f"""{context_note}
+Current question: {query}"""
+            )
+        )
 
         return self.generate(messages, force_local=force_local)
 
@@ -263,3 +278,19 @@ Answer based on the context above:"""
     def list_available_providers(self) -> list[str]:
         """List names of available providers."""
         return [p.name for p in self._get_available_providers()]
+
+    def set_local_model(self, model_name: str) -> None:
+        """Switch the local LLM to a different Ollama model.
+
+        Args:
+            model_name: Name of the model to use (e.g., 'mistral:7b', 'deepseek-r1:7b')
+        """
+        self._local_llm.set_model(model_name)
+
+    def get_current_model(self) -> str:
+        """Get the current local model name."""
+        return self._local_llm.get_model()
+
+    def list_models(self) -> list[str]:
+        """List all available Ollama models."""
+        return LocalLLM.list_available_models()

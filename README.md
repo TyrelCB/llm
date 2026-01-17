@@ -11,7 +11,10 @@ A local-first LLM agent with RAG-based knowledge base, tool execution, and intel
 - **Multi-Provider Fallback**: Automatic fallback chain (Ollama → Claude → GPT-4 → Gemini → Grok)
 - **Knowledge Base Updates**: Automatically extracts and stores facts from external provider responses
 - **Sandboxed Tool Execution**: Safe bash command execution with validation and approval
-- **Multiple Interfaces**: Interactive CLI and REST API
+- **Runtime Model Switching**: Switch between Ollama models at runtime via `/model` command or `--model` flag
+- **Conversation Memory**: Agent remembers previous exchanges within a session
+- **Natural Language Tools**: LLM interprets queries like "check disk space" and generates appropriate commands
+- **Multiple Interfaces**: Interactive CLI and REST API with real-time status display
 
 ## Architecture
 
@@ -94,15 +97,27 @@ python scripts/run.py chat
 ```
 
 Commands in chat:
+- `/model` - Show current model
+- `/model <name>` - Switch to a different model (e.g., `/model deepseek-r1:7b`)
+- `/models` - List available Ollama models
 - `/clear` - Clear conversation history
-- `/stats` - Show knowledge base stats
+- `/stats` - Show knowledge base and model stats
 - `/help` - Show help
 - `/quit` - Exit
+
+The CLI shows:
+- Current model and version on welcome screen
+- Real-time elapsed time while processing
+- Processing steps (routing, retrieving, grading, etc.)
+- Grounding status: `Grounded (KB)`, `Grounded (Tools)`, `Local`, or `External`
 
 ### Single Query
 
 ```bash
 python scripts/run.py query "What is machine learning?"
+
+# Use a specific model
+python scripts/run.py query "Explain quantum computing" --model deepseek-r1:7b
 ```
 
 ### REST API
@@ -115,7 +130,10 @@ API endpoints available at `http://localhost:8000/docs`:
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/v1/query` | POST | Query the agent |
+| `/api/v1/query` | POST | Query the agent (supports optional `model` field) |
+| `/api/v1/model` | GET | Get current model |
+| `/api/v1/model` | POST | Switch model |
+| `/api/v1/models` | GET | List available Ollama models |
 | `/api/v1/ingest/text` | POST | Ingest raw text |
 | `/api/v1/ingest/file` | POST | Ingest a file |
 | `/api/v1/ingest/directory` | POST | Ingest a directory |

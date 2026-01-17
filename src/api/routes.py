@@ -58,6 +58,9 @@ class QueryRequest(BaseModel):
     include_history: bool = Field(
         default=True, description="Include conversation history"
     )
+    model: str | None = Field(
+        default=None, description="Ollama model to use for this query"
+    )
 
 
 class QueryResponse(BaseModel):
@@ -136,6 +139,11 @@ async def query_agent(request: QueryRequest) -> QueryResponse:
     """
     try:
         agent = get_agent()
+
+        # Set model if specified
+        if request.model:
+            agent.set_model(request.model)
+
         result = await agent.aquery(
             query=request.query,
             include_history=request.include_history,
@@ -158,6 +166,11 @@ def query_agent_sync(request: QueryRequest) -> QueryResponse:
     """Synchronous version of query endpoint."""
     try:
         agent = get_agent()
+
+        # Set model if specified
+        if request.model:
+            agent.set_model(request.model)
+
         result = agent.query(
             query=request.query,
             include_history=request.include_history,
@@ -188,6 +201,52 @@ def get_history_length():
     """Get conversation history length."""
     agent = get_agent()
     return {"length": agent.get_history_length()}
+
+
+# Model management endpoints
+
+
+class ModelResponse(BaseModel):
+    """Response model for current model."""
+
+    model: str = Field(..., description="Current Ollama model name")
+
+
+class ModelListResponse(BaseModel):
+    """Response model for available models."""
+
+    models: list[str] = Field(..., description="List of available Ollama models")
+    current: str = Field(..., description="Currently selected model")
+
+
+class SetModelRequest(BaseModel):
+    """Request model for setting the model."""
+
+    model: str = Field(..., description="Model name to switch to")
+
+
+@router.get("/model", response_model=ModelResponse)
+def get_current_model() -> ModelResponse:
+    """Get the currently selected Ollama model."""
+    agent = get_agent()
+    return ModelResponse(model=agent.get_model())
+
+
+@router.post("/model", response_model=ModelResponse)
+def set_current_model(request: SetModelRequest) -> ModelResponse:
+    """Switch to a different Ollama model."""
+    agent = get_agent()
+    agent.set_model(request.model)
+    return ModelResponse(model=agent.get_model())
+
+
+@router.get("/models", response_model=ModelListResponse)
+def list_available_models() -> ModelListResponse:
+    """List all available Ollama models."""
+    agent = get_agent()
+    models = agent.list_models()
+    current = agent.get_model()
+    return ModelListResponse(models=models, current=current)
 
 
 @router.post("/ingest/text", response_model=IngestResponse)

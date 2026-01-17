@@ -11,6 +11,7 @@ from src.agent.nodes import (
     generate_local,
     get_grading_decision,
     get_routing_decision,
+    get_selector,
     grade_documents,
     prepare_tool_calls,
     retrieve_documents,
@@ -193,6 +194,25 @@ class Agent:
     def get_history_length(self) -> int:
         """Get number of messages in history."""
         return len(self._conversation_history)
+
+    def set_model(self, model_name: str) -> None:
+        """Switch the local LLM to a different Ollama model.
+
+        Args:
+            model_name: Name of the model to use (e.g., 'mistral:7b', 'deepseek-r1:7b')
+        """
+        selector = get_selector()
+        selector.set_local_model(model_name)
+
+    def get_model(self) -> str:
+        """Get the current local model name."""
+        selector = get_selector()
+        return selector.get_current_model()
+
+    def list_models(self) -> list[str]:
+        """List all available Ollama models."""
+        selector = get_selector()
+        return selector.list_models()
 
 
 # Module-level instance for convenience
