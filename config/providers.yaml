@@ -1,0 +1,74 @@
+# LiteLLM Provider Configuration
+# Priority order for fallback chain
+
+model_list:
+  # Primary: Local Ollama
+  - model_name: "local"
+    litellm_params:
+      model: "ollama/mistral:7b"
+      api_base: "http://localhost:11434"
+    model_info:
+      mode: "chat"
+      supports_function_calling: false
+
+  # Fallback 1: Anthropic Claude
+  - model_name: "claude"
+    litellm_params:
+      model: "anthropic/claude-sonnet-4-20250514"
+      api_key: "os.environ/ANTHROPIC_API_KEY"
+    model_info:
+      mode: "chat"
+      supports_function_calling: true
+
+  # Fallback 2: OpenAI GPT-4o
+  - model_name: "gpt4o"
+    litellm_params:
+      model: "openai/gpt-4o"
+      api_key: "os.environ/OPENAI_API_KEY"
+    model_info:
+      mode: "chat"
+      supports_function_calling: true
+
+  # Fallback 3: Google Gemini
+  - model_name: "gemini"
+    litellm_params:
+      model: "gemini/gemini-1.5-pro"
+      api_key: "os.environ/GOOGLE_API_KEY"
+    model_info:
+      mode: "chat"
+      supports_function_calling: true
+
+  # Fallback 4: xAI Grok
+  - model_name: "grok"
+    litellm_params:
+      model: "xai/grok-beta"
+      api_key: "os.environ/XAI_API_KEY"
+    model_info:
+      mode: "chat"
+      supports_function_calling: true
+
+# Router settings
+router_settings:
+  routing_strategy: "simple-shuffle"
+  num_retries: 2
+  timeout: 120
+  fallbacks:
+    - ["local", "claude", "gpt4o", "gemini", "grok"]
+
+# Fallback chain priority (used by selector.py)
+fallback_priority:
+  - name: "local"
+    required: true
+    check_availability: true
+  - name: "claude"
+    required: false
+    env_key: "ANTHROPIC_API_KEY"
+  - name: "gpt4o"
+    required: false
+    env_key: "OPENAI_API_KEY"
+  - name: "gemini"
+    required: false
+    env_key: "GOOGLE_API_KEY"
+  - name: "grok"
+    required: false
+    env_key: "XAI_API_KEY"
