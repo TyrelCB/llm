@@ -56,3 +56,14 @@ This is a local-first LLM agent using LangGraph for workflow orchestration. The 
 
 - **CLI**: `scripts/run.py` (Typer) - chat, serve, query, check commands
 - **API**: `src/api/routes.py` (FastAPI) - /api/v1/query, /api/v1/ingest/*, /api/v1/kb/*
+
+## Development Workflow
+
+When making changes to this repository:
+
+1. **Sync with remote** - Ensure repo is up to date: `git pull origin master`
+2. **Document plan** - Write implementation plan in `plan.md` before starting work
+3. **Implement changes** - Make changes and update `plan.md` to track progress
+4. **Update version** - Bump version in `pyproject.toml`
+5. **Update documentation** - Update README.md, CLAUDE.md, and any other relevant docs
+6. **Commit and push** - `git add . && git commit -m "message" && git push`
