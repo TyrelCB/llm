@@ -244,9 +244,11 @@ class ProviderSelector:
 
 Instructions:
 1. For questions about the conversation itself (e.g., "what was my last question?", "what did we discuss?"), use the conversation history above.
-2. For questions about specific topics, use the provided context documents.
-3. If the context doesn't contain enough information, say so clearly.
-4. Be concise but thorough in your answers."""
+2. IMPORTANT: When context from the knowledge base is provided, ALWAYS prioritize it over general knowledge. The user likely wants information about their specific documents/projects.
+3. If the query term (like "ACME") appears in the knowledge base context, answer based on that context, not general knowledge.
+4. If you're unsure whether the user wants KB-specific info or general knowledge, ask for clarification. Start your response with "CLARIFY:" followed by the question.
+5. If the context doesn't contain relevant information, say so and offer to answer from general knowledge.
+6. Be concise but thorough in your answers."""
 
         messages = [SystemMessage(content=system_prompt or default_system)]
 

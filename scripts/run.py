@@ -244,8 +244,22 @@ def _process_query(agent, query: str) -> None:
     agent_logger.removeHandler(status_handler)
     llm_logger.removeHandler(status_handler)
 
+    response_text = result["response"]
+
+    # Check if agent is asking for clarification
+    if response_text.strip().startswith("CLARIFY:"):
+        clarify_question = response_text.strip()[8:].strip()
+        console.print(f"\n[bold yellow]Clarification needed:[/bold yellow] {clarify_question}")
+        clarification = Prompt.ask("[bold cyan]Your answer[/bold cyan]")
+
+        # Run follow-up query with clarification
+        follow_up = f"{query} (Clarification: {clarification})"
+        console.print()
+        _process_query(agent, follow_up)
+        return
+
     console.print("\n[bold green]Agent[/bold green]")
-    console.print(Markdown(result["response"]))
+    console.print(Markdown(response_text))
 
     # Determine grounding status
     is_local_provider = result["provider"] in ("ollama", "local")
