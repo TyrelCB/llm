@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     ollama_model: str = Field(default="mistral:7b")
     ollama_embedding_model: str = Field(default="nomic-embed-text")
     ollama_timeout: int = Field(default=120)
+    ollama_num_ctx: int = Field(default=8192)
 
     # ChromaDB settings
     chroma_collection_name: str = Field(default="knowledge_base")
@@ -58,6 +59,17 @@ class Settings(BaseSettings):
     api_host: str = Field(default="0.0.0.0")
     api_port: int = Field(default=8000)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = Field(default="INFO")
+
+    # Mode settings
+    default_mode: str = Field(default="chat")
+
+    # Stable Diffusion settings
+    comfyui_url: str = Field(default="http://localhost:8188")
+    automatic1111_url: str = Field(default="http://localhost:7860")
+    image_output_dir: Path = Field(default=Path(__file__).parent.parent / "data" / "images")
+
+    # Web search settings
+    searxng_url: str | None = Field(default=None)
 
 
 settings = Settings()

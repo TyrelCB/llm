@@ -8,6 +8,8 @@ from langchain_core.documents import Document
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 
+from src.agent.modes import AgentMode
+
 
 class RouteDecision(Enum):
     """Routing decisions for the agent."""
@@ -17,6 +19,8 @@ class RouteDecision(Enum):
     GENERATE = "generate"
     REWRITE = "rewrite"
     FALLBACK = "fallback"
+    WEB = "web"
+    IMAGE = "image"
 
 
 @dataclass
@@ -55,6 +59,7 @@ class AgentState:
         provider_used: Which LLM provider was used
         should_update_kb: Whether to update knowledge base
         metadata: Additional state metadata
+        mode: Current agent mode
     """
 
     def __init__(
@@ -71,6 +76,7 @@ class AgentState:
         provider_used: str = "",
         should_update_kb: bool = False,
         metadata: dict[str, Any] | None = None,
+        mode: AgentMode = AgentMode.CHAT,
     ) -> None:
         self.messages = messages or []
         self.query = query
@@ -84,6 +90,7 @@ class AgentState:
         self.provider_used = provider_used
         self.should_update_kb = should_update_kb
         self.metadata = metadata or {}
+        self.mode = mode
 
 
 # TypedDict version for LangGraph compatibility
@@ -105,10 +112,19 @@ class AgentStateDict(TypedDict, total=False):
     provider_used: str
     should_update_kb: bool
     metadata: dict[str, Any]
+    mode: str  # AgentMode value
+    tokens_used: int
+    input_tokens: int
+    output_tokens: int
 
 
-def create_initial_state(query: str, messages: list[BaseMessage] | None = None) -> AgentStateDict:
+def create_initial_state(
+    query: str,
+    messages: list[BaseMessage] | None = None,
+    mode: AgentMode | str = AgentMode.CHAT,
+) -> AgentStateDict:
     """Create initial state for a new agent run."""
+    mode_value = mode.value if isinstance(mode, AgentMode) else mode
     return AgentStateDict(
         messages=messages or [],
         query=query,
@@ -122,4 +138,5 @@ def create_initial_state(query: str, messages: list[BaseMessage] | None = None) 
         provider_used="",
         should_update_kb=False,
         metadata={},
+        mode=mode_value,
     )

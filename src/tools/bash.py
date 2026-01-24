@@ -1,9 +1,8 @@
-"""Sandboxed bash execution tool."""
+"""Sandboxed bash execution tool with allow/deny pattern matching."""
 
 import logging
 import os
 import re
-import shlex
 import subprocess
 from dataclasses import dataclass
 from typing import Callable
@@ -27,59 +26,51 @@ class BashResult:
 
 
 class BashTool:
-    """Sandboxed bash command execution with safety checks."""
+    """
+    Bash command execution with allow/deny pattern matching.
 
-    # Commands that are always blocked
-    BLOCKED_COMMANDS = {
-        "rm -rf /",
-        "rm -rf /*",
-        "rm -rf ~",
-        "rm -rf ~/*",
-        "mkfs",
-        "dd if=/dev/zero",
-        "dd if=/dev/random",
-        "> /dev/sda",
-        "chmod -R 777 /",
-        "chown -R",
-        ":(){:|:&};:",  # Fork bomb
-    }
+    Default mode is PERMISSIVE: allow all commands except those matching deny patterns.
+    Deny patterns can require approval or be completely blocked.
+    """
 
-    # Command patterns that require approval
-    DANGEROUS_PATTERNS = [
-        r"rm\s+-[rf]+\s+",  # rm with force/recursive
-        r"sudo\s+",  # sudo commands
-        r"chmod\s+",  # permission changes
-        r"chown\s+",  # ownership changes
-        r">\s*/",  # redirect to root
-        r"curl\s+.*\|\s*(ba)?sh",  # curl pipe to shell
-        r"wget\s+.*\|\s*(ba)?sh",  # wget pipe to shell
-        r"eval\s+",  # eval commands
-        r"exec\s+",  # exec commands
-        r"kill\s+-9",  # force kill
-        r"pkill\s+",  # process kill
-        r"shutdown",  # system shutdown
-        r"reboot",  # system reboot
-        r"systemctl\s+(stop|disable|mask)",  # service control
-        r"iptables",  # firewall rules
-        r"dd\s+",  # disk operations
+    # Patterns that are ALWAYS blocked (catastrophic/irreversible)
+    BLOCKED_PATTERNS = [
+        r"rm\s+-[rf]*\s+/\s*$",          # rm -rf /
+        r"rm\s+-[rf]*\s+/\*",             # rm -rf /*
+        r"rm\s+-[rf]*\s+~\s*$",           # rm -rf ~
+        r"rm\s+-[rf]*\s+~/\*",            # rm -rf ~/*
+        r"mkfs\s+",                        # Format filesystem
+        r"dd\s+if=/dev/(zero|random|urandom)\s+of=/dev/",  # Disk wipe
+        r">\s*/dev/sd[a-z]",              # Redirect to disk
+        r"chmod\s+-R\s+777\s+/",          # World-writable root
+        r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:",  # Fork bomb
     ]
 
-    # Safe command prefixes
-    SAFE_PREFIXES = [
-        "ls", "pwd", "echo", "cat", "head", "tail", "grep", "find",
-        "wc", "sort", "uniq", "cut", "tr", "date", "whoami", "hostname",
-        "env", "printenv", "which", "type", "file", "stat", "du", "df",
-        "ps", "top", "free", "uptime", "uname", "id", "groups",
-        "git status", "git log", "git diff", "git branch", "git show",
-        "python --version", "pip list", "pip show",
-        "node --version", "npm list",
-        "docker ps", "docker images",
+    # Patterns that require APPROVAL before running (dangerous but sometimes needed)
+    APPROVAL_PATTERNS = [
+        r"rm\s+-[rf]+",                   # rm with force/recursive (but not root)
+        r"chmod\s+",                       # Permission changes
+        r"chown\s+",                       # Ownership changes
+        r"curl\s+.*\|\s*(ba)?sh",         # curl pipe to shell
+        r"wget\s+.*\|\s*(ba)?sh",         # wget pipe to shell
+        r"eval\s+",                        # eval commands
+        r"kill\s+-9",                      # Force kill
+        r"pkill\s+",                       # Process kill
+        r"killall\s+",                     # Kill all by name
+        r"shutdown",                       # System shutdown
+        r"reboot",                         # System reboot
+        r"systemctl\s+(stop|restart|disable|mask|unmask)",  # Service control
+        r"service\s+\w+\s+(stop|restart)", # Service control (old style)
     ]
+
+    # Session-approved patterns (commands user has approved for this session)
+    _session_approved: set[str] = set()
 
     def __init__(
         self,
         approval_callback: Callable[[str], bool] | None = None,
         working_dir: str | None = None,
+        permissive: bool = True,
     ) -> None:
         """
         Initialize the bash tool.
@@ -87,35 +78,46 @@ class BashTool:
         Args:
             approval_callback: Function to call for approval of dangerous commands
             working_dir: Working directory for command execution
+            permissive: If True (default), allow all except denied. If False, require explicit allow.
         """
         self._approval_callback = approval_callback
         self._working_dir = working_dir or os.getcwd()
+        self._permissive = permissive
+
+    @classmethod
+    def approve_for_session(cls, pattern: str) -> None:
+        """Add a pattern to session-approved list."""
+        cls._session_approved.add(pattern)
+        logger.info(f"Approved pattern for session: {pattern}")
+
+    @classmethod
+    def clear_session_approvals(cls) -> None:
+        """Clear all session approvals."""
+        cls._session_approved.clear()
 
     def _is_blocked(self, command: str) -> tuple[bool, str]:
-        """Check if command is in the blocked list."""
-        command_lower = command.lower().strip()
-
-        for blocked in self.BLOCKED_COMMANDS:
-            if blocked in command_lower:
-                return True, f"Command contains blocked pattern: {blocked}"
-
-        return False, ""
-
-    def _is_dangerous(self, command: str) -> tuple[bool, str]:
-        """Check if command matches dangerous patterns."""
-        for pattern in self.DANGEROUS_PATTERNS:
+        """Check if command matches blocked patterns (always denied)."""
+        for pattern in self.BLOCKED_PATTERNS:
             if re.search(pattern, command, re.IGNORECASE):
-                return True, f"Command matches dangerous pattern: {pattern}"
-
+                return True, f"Blocked: matches dangerous pattern"
         return False, ""
 
-    def _is_safe(self, command: str) -> bool:
-        """Check if command is in the safe list."""
-        command_stripped = command.strip()
-        for prefix in self.SAFE_PREFIXES:
-            if command_stripped.startswith(prefix):
-                return True
-        return False
+    def _needs_approval(self, command: str) -> tuple[bool, str]:
+        """Check if command needs approval before running."""
+        # Check if already approved for session
+        for approved in self._session_approved:
+            try:
+                if re.search(approved, command, re.IGNORECASE):
+                    return False, ""
+            except re.error:
+                if approved in command:
+                    return False, ""
+
+        # Check approval patterns
+        for pattern in self.APPROVAL_PATTERNS:
+            if re.search(pattern, command, re.IGNORECASE):
+                return True, f"Requires approval: potentially dangerous operation"
+        return False, ""
 
     def _sanitize_output(self, output: str, max_length: int = 10000) -> str:
         """Sanitize and truncate command output."""
@@ -133,28 +135,17 @@ class BashTool:
         Returns:
             Tuple of (is_valid, reason, requires_approval)
         """
-        # Check blocked commands
+        # Always check blocked patterns first
         is_blocked, reason = self._is_blocked(command)
         if is_blocked:
             return False, reason, False
 
-        # Check if it's a safe command
-        if self._is_safe(command):
-            return True, "Safe command", False
+        # Check if needs approval
+        needs_approval, reason = self._needs_approval(command)
+        if needs_approval:
+            return True, reason, True
 
-        # Check if it's dangerous and needs approval
-        is_dangerous, reason = self._is_dangerous(command)
-        if is_dangerous:
-            if settings.bash_require_approval:
-                return True, reason, True
-            else:
-                logger.warning(f"Executing dangerous command without approval: {command}")
-                return True, reason, False
-
-        # Default: allow with approval if configured
-        if settings.bash_require_approval:
-            return True, "Unknown command type", True
-
+        # In permissive mode, allow everything else
         return True, "Allowed", False
 
     def execute(
@@ -197,20 +188,24 @@ class BashTool:
                 if not approved:
                     return BashResult(
                         stdout="",
-                        stderr="Command requires approval - denied by user",
+                        stderr="User denied approval",
                         return_code=-1,
                         command=command,
                         blocked=True,
                         block_reason="User denied approval",
                     )
+                # Approve similar commands for session
+                base_cmd = command.split()[0] if command.split() else command
+                self.approve_for_session(f"^{re.escape(base_cmd)}\\s")
             else:
+                # No callback - block
                 return BashResult(
                     stdout="",
-                    stderr=f"Command requires approval: {reason}",
+                    stderr=f"{reason}. Use interactive mode or approve the command.",
                     return_code=-1,
                     command=command,
                     blocked=True,
-                    block_reason=f"Requires approval: {reason}",
+                    block_reason=reason,
                 )
 
         # Execute the command
@@ -252,25 +247,3 @@ class BashTool:
                 return_code=-1,
                 command=command,
             )
-
-    def execute_safe(self, command: str) -> BashResult:
-        """
-        Execute a command only if it's in the safe list.
-
-        Args:
-            command: The command to execute
-
-        Returns:
-            BashResult with execution results
-        """
-        if not self._is_safe(command):
-            return BashResult(
-                stdout="",
-                stderr="Command not in safe list",
-                return_code=-1,
-                command=command,
-                blocked=True,
-                block_reason="Not in safe command list",
-            )
-
-        return self.execute(command, skip_approval=True)

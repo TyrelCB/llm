@@ -4,6 +4,7 @@ import logging
 import sys
 import time
 import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import typer
@@ -13,13 +14,158 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.live import Live
 from rich.text import Text
+from rich.table import Table
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from config.settings import settings
+if "chat" in sys.argv:
+    sys.stderr.write("Launching chat (loading CLI)...\n")
+    sys.stderr.flush()
 
-__version__ = "0.2.0"
+from config.settings import settings
+from src.agent.modes import AgentMode, get_mode_config, get_next_mode, list_modes, get_mode_by_name
+
+__version__ = "0.6.0"
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SessionStats:
+    """Track session statistics."""
+
+    start_time: float = field(default_factory=time.time)
+    queries: int = 0
+    shell_commands: int = 0
+    plans_executed: int = 0
+    kb_retrievals: int = 0
+    documents_used: int = 0
+    tools_executed: int = 0
+    llm_calls: int = 0
+    total_response_time: float = 0.0
+    clarifications: int = 0
+    errors: int = 0
+    total_tokens: int = 0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    context_window_size: int = 0
+    max_tokens_per_query: int = 0
+    max_input_tokens: int = 0
+    max_output_tokens: int = 0
+
+    def record_query(self, result: dict, response_time: float) -> None:
+        """Record stats from a query result."""
+        self.queries += 1
+        self.total_response_time += response_time
+        self.llm_calls += 1
+
+        # Track token usage
+        tokens = result.get("tokens_used", 0)
+        input_tokens = result.get("input_tokens", 0)
+        output_tokens = result.get("output_tokens", 0)
+
+        if tokens:
+            self.total_tokens += tokens
+            self.max_tokens_per_query = max(self.max_tokens_per_query, tokens)
+
+        if input_tokens:
+            self.total_input_tokens += input_tokens
+            self.max_input_tokens = max(self.max_input_tokens, input_tokens)
+
+        if output_tokens:
+            self.total_output_tokens += output_tokens
+            self.max_output_tokens = max(self.max_output_tokens, output_tokens)
+
+        if result.get("provider") == "shell":
+            self.shell_commands += 1
+        if result.get("documents_used", 0) > 0:
+            self.kb_retrievals += 1
+            self.documents_used += result["documents_used"]
+        if result.get("tool_results"):
+            self.tools_executed += len(result["tool_results"])
+
+    def record_plan(self) -> None:
+        """Record a plan execution."""
+        self.plans_executed += 1
+
+    def record_clarification(self) -> None:
+        """Record a clarification request."""
+        self.clarifications += 1
+
+    def record_error(self) -> None:
+        """Record an error."""
+        self.errors += 1
+
+    @property
+    def duration(self) -> float:
+        """Session duration in seconds."""
+        return time.time() - self.start_time
+
+    @property
+    def avg_response_time(self) -> float:
+        """Average response time per query."""
+        return self.total_response_time / self.queries if self.queries > 0 else 0
+
+    def display(self, console: Console) -> None:
+        """Display session statistics."""
+        duration = self.duration
+        hours, remainder = divmod(int(duration), 3600)
+        minutes, seconds = divmod(remainder, 60)
+
+        if hours > 0:
+            duration_str = f"{hours}h {minutes}m {seconds}s"
+        elif minutes > 0:
+            duration_str = f"{minutes}m {seconds}s"
+        else:
+            duration_str = f"{seconds}s"
+
+        table = Table(title="Session Statistics", show_header=False, box=None)
+        table.add_column("Stat", style="cyan")
+        table.add_column("Value", style="green")
+
+        table.add_row("Duration", duration_str)
+        table.add_row("Queries", str(self.queries))
+        if self.shell_commands > 0:
+            table.add_row("Shell commands", str(self.shell_commands))
+        if self.plans_executed > 0:
+            table.add_row("Plans executed", str(self.plans_executed))
+        if self.kb_retrievals > 0:
+            table.add_row("KB retrievals", str(self.kb_retrievals))
+        if self.documents_used > 0:
+            table.add_row("Documents used", str(self.documents_used))
+        if self.tools_executed > 0:
+            table.add_row("Tools executed", str(self.tools_executed))
+        if self.clarifications > 0:
+            table.add_row("Clarifications", str(self.clarifications))
+        if self.errors > 0:
+            table.add_row("Errors", str(self.errors))
+        if self.queries > 0:
+            table.add_row("Avg response time", f"{self.avg_response_time:.1f}s")
+
+        # Context window usage stats
+        if self.total_tokens > 0 and self.context_window_size > 0:
+            table.add_row("", "")  # Spacer
+            table.add_row("Total tokens", f"{self.total_tokens:,}")
+            if self.total_input_tokens > 0:
+                table.add_row("  Input tokens", f"↓ {self.total_input_tokens:,}")
+            if self.total_output_tokens > 0:
+                table.add_row("  Output tokens", f"↑ {self.total_output_tokens:,}")
+            table.add_row("Max tokens/query", f"{self.max_tokens_per_query:,}")
+            if self.max_input_tokens > 0:
+                table.add_row("  Max input", f"↓ {self.max_input_tokens:,}")
+            if self.max_output_tokens > 0:
+                table.add_row("  Max output", f"↑ {self.max_output_tokens:,}")
+            table.add_row("Avg tokens/query", f"{self.total_tokens // self.queries:,}")
+            table.add_row("Context window", f"{self.context_window_size:,}")
+            max_usage_pct = (self.max_tokens_per_query / self.context_window_size) * 100
+            table.add_row("Peak usage", f"{max_usage_pct:.1f}%")
+
+        console.print()
+        console.print(table)
+
+
+# Global session stats
+_session_stats: SessionStats | None = None
 
 
 class StatusHandler(logging.Handler):
@@ -47,27 +193,257 @@ app = typer.Typer(
 console = Console()
 
 
+def _get_mode_color(mode: AgentMode) -> str:
+    """Get the display color for a mode."""
+    colors = {
+        AgentMode.CHAT: "cyan",
+        AgentMode.PLAN: "yellow",
+        AgentMode.ASK: "green",
+        AgentMode.EXECUTE: "red",
+        AgentMode.CODE: "magenta",
+        AgentMode.IMAGE: "blue",
+        AgentMode.RESEARCH: "bright cyan",
+        AgentMode.DEBUG: "bright_yellow",
+        AgentMode.CREATIVE: "bright_magenta",
+    }
+    return colors.get(mode, "white")
+
+
+def _get_prompt_color(mode: AgentMode) -> str:
+    """Get a prompt_toolkit-safe color for a mode."""
+    colors = {
+        AgentMode.CHAT: "ansicyan",
+        AgentMode.PLAN: "ansiyellow",
+        AgentMode.ASK: "ansigreen",
+        AgentMode.EXECUTE: "ansired",
+        AgentMode.CODE: "ansimagenta",
+        AgentMode.IMAGE: "ansiblue",
+        AgentMode.RESEARCH: "ansibrightcyan",
+        AgentMode.DEBUG: "ansibrightyellow",
+        AgentMode.CREATIVE: "ansibrightmagenta",
+    }
+    return colors.get(mode, "ansiwhite")
+
+
+def _get_state_file() -> Path:
+    """Get path to state persistence file."""
+    state_dir = Path.home() / ".config" / "llm-agent"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    return state_dir / "state.json"
+
+
+def _save_state(model: str, mode: str) -> None:
+    """Save current model and mode to disk."""
+    import json
+    state_file = _get_state_file()
+    try:
+        state = {"model": model, "mode": mode}
+        state_file.write_text(json.dumps(state, indent=2))
+    except Exception as e:
+        logger.warning(f"Failed to save state: {e}")
+
+
+def _load_state() -> dict:
+    """Load last model and mode from disk."""
+    import json
+    state_file = _get_state_file()
+    try:
+        if state_file.exists():
+            return json.loads(state_file.read_text())
+    except Exception as e:
+        logger.warning(f"Failed to load state: {e}")
+    return {}
+
+
+def _interactive_model_selector(agent) -> str | None:
+    """Interactive model selection with numbered menu."""
+    models = agent.list_models()
+    current = agent.get_model()
+
+    if not models:
+        console.print("[yellow]No models found. Is Ollama running?[/yellow]")
+        return None
+
+    console.print("\n[bold]Available Ollama Models:[/bold]")
+    for i, model in enumerate(models, 1):
+        marker = "[green]*[/green]" if model == current else " "
+        console.print(f"{marker} {i:2}. {model}")
+
+    console.print("\n[dim]Enter number to select, or press Enter to cancel[/dim]")
+    choice = Prompt.ask("[bold cyan]Select model[/bold cyan]", default="")
+
+    if not choice.strip():
+        return None
+
+    try:
+        idx = int(choice) - 1
+        if 0 <= idx < len(models):
+            return models[idx]
+        else:
+            console.print("[yellow]Invalid selection[/yellow]")
+            return None
+    except ValueError:
+        console.print("[yellow]Invalid input[/yellow]")
+        return None
+
+
+def _create_prompt_session(agent):
+    """Create a prompt_toolkit session with key bindings and tab completion."""
+    try:
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.key_binding import KeyBindings
+        from prompt_toolkit.keys import Keys
+        from prompt_toolkit.completion import WordCompleter
+
+        # Create completer for commands and common terms
+        commands = [
+            "/quit", "/exit", "/q", "/clear", "/help", "/stats",
+            "/model", "/models", "/mode", "/modes", "/plan", "/context"
+        ]
+
+        # Add mode names
+        mode_names = [f"/mode {mode.value}" for mode in AgentMode]
+
+        # Get available models for completion
+        try:
+            model_names = [f"/model {m}" for m in agent.list_models()]
+        except:
+            model_names = []
+
+        completer_words = commands + mode_names + model_names
+        completer = WordCompleter(
+            completer_words,
+            ignore_case=True,
+            sentence=True,
+            match_middle=True,
+        )
+
+        bindings = KeyBindings()
+
+        # Store a flag for mode switch handling
+        mode_switched = {"value": False}
+
+        @bindings.add(Keys.BackTab)  # Shift+Tab
+        def _(event):
+            """Cycle to next mode on Shift+Tab."""
+            new_mode = agent.cycle_mode()
+            mode_config = get_mode_config(new_mode)
+            color = _get_mode_color(new_mode)
+            # Save state
+            _save_state(agent.get_model(), new_mode.value)
+            # Set flag and exit with special marker
+            mode_switched["value"] = True
+            event.app.exit(result='__MODE_SWITCH__')
+
+        session = PromptSession(
+            key_bindings=bindings,
+            completer=completer,
+            complete_while_typing=False,  # Only complete on Tab
+        )
+        return session
+    except ImportError:
+        return None
+
+
 @app.command()
 def chat(
     query: str = typer.Argument(None, help="Single query to process"),
+    mode: str = typer.Option(None, "--mode", "-m", help="Initial mode (chat, plan, ask, execute, code, image, research, debug, creative)"),
 ) -> None:
     """
     Start an interactive chat session with the agent.
 
     If a query is provided, process it and exit.
     Otherwise, start an interactive REPL.
+
+    Use Shift+Tab to cycle between modes.
     """
-    from src.agent import Agent
-    from src.llm.local import LocalLLM
+    import importlib
+    import os
+    import sys
 
-    # Check Ollama availability
-    if not LocalLLM.check_availability():
-        console.print(
-            "[yellow]Warning:[/yellow] Ollama is not available. "
-            f"Ensure Ollama is running at {settings.ollama_base_url}"
-        )
+    sys.stderr.write("Starting chat session (loading modules)...\n")
+    sys.stderr.flush()
+    global _session_stats
 
+    timing_enabled = os.getenv("LLM_IMPORT_TIMING", "1") != "0" or bool(os.getenv("LLM_IMPORT_TIMING_VERBOSE"))
+
+    def _timed_import(module_name: str, attr: str | None = None):
+        if not timing_enabled:
+            module = importlib.import_module(module_name)
+            return getattr(module, attr) if attr else module
+
+        start = time.perf_counter()
+        module = importlib.import_module(module_name)
+        duration = time.perf_counter() - start
+        sys.stderr.write(f"Imported {module_name} in {duration:.2f}s\n")
+        sys.stderr.flush()
+        return getattr(module, attr) if attr else module
+
+    if os.getenv("LLM_IMPORT_TIMING_VERBOSE"):
+        for module_name in [
+            "src.knowledge.vectorstore",
+            "src.llm.selector",
+            "src.agent.nodes",
+            "src.agent.graph",
+        ]:
+            _timed_import(module_name)
+
+    Agent = _timed_import("src.agent", "Agent")
+
+    sys.stderr.write("Core modules loaded. Initializing components...\n")
+    sys.stderr.flush()
+
+    # Initialize session stats
+    _session_stats = SessionStats()
+
+    # Check Ollama availability without blocking startup
+    def _check_ollama_async() -> None:
+        def _worker() -> None:
+            try:
+                LocalLLM = _timed_import("src.llm.local", "LocalLLM")
+                if not LocalLLM.check_availability():
+                    console.print(
+                        "[yellow]Warning:[/yellow] Ollama is not available. "
+                        f"Ensure Ollama is running at {settings.ollama_base_url}"
+                    )
+            except Exception as exc:
+                console.print(f"[yellow]Warning:[/yellow] Ollama check failed: {exc}")
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    _check_ollama_async()
+
+    init_start = time.perf_counter()
+    console.print("[dim]Initializing agent...[/dim]")
     agent = Agent()
+    console.print(f"[dim]Initialization complete in {time.perf_counter() - init_start:.1f}s[/dim]")
+
+    # Load saved state (last model and mode)
+    saved_state = _load_state()
+
+    # Set initial mode - priority: CLI arg > saved state > default
+    if mode:
+        mode_enum = get_mode_by_name(mode)
+        if mode_enum:
+            agent.set_mode(mode_enum)
+        else:
+            console.print(f"[yellow]Unknown mode '{mode}', using default (chat)[/yellow]")
+    elif saved_state.get("mode"):
+        mode_enum = get_mode_by_name(saved_state["mode"])
+        if mode_enum:
+            agent.set_mode(mode_enum)
+            console.print(f"[dim]Restored mode: {mode_enum.value}[/dim]")
+
+    # Set model from saved state if available
+    if saved_state.get("model"):
+        try:
+            available = agent.list_models()
+            if available and saved_state["model"] in available:
+                agent.set_model(saved_state["model"])
+                console.print(f"[dim]Restored model: {saved_state['model']}[/dim]")
+        except Exception as e:
+            logger.debug(f"Failed to restore model: {e}")
 
     if query:
         # Single query mode
@@ -76,26 +452,75 @@ def chat(
 
     # Interactive mode
     current_model = agent.get_model()
+    current_mode = agent.get_mode()
+    mode_color = _get_mode_color(current_mode)
+
+    # Get model context window info
+    try:
+        from src.llm.local import LocalLLM
+        llm = LocalLLM(current_model)
+        model_info = llm.get_model_info()
+        context_length = model_info.get("context_length", settings.ollama_num_ctx)
+        _session_stats.context_window_size = context_length
+    except Exception as e:
+        logger.debug(f"Failed to get model info: {e}")
+        context_length = settings.ollama_num_ctx
+        _session_stats.context_window_size = context_length
+
     console.print(
         Panel(
             "[bold cyan]LLM Agent[/bold cyan] [dim]v" + __version__ + "[/dim]\n"
             "Local-first AI assistant with RAG knowledge base\n\n"
-            f"Model: [green]{current_model}[/green]\n\n"
+            f"Model: [green]{current_model}[/green]\n"
+            f"Mode:  [{mode_color}]{current_mode.value}[/{mode_color}]\n"
+            f"Context Window: [cyan]{context_length:,}[/cyan] tokens\n\n"
+            "Mode switching:\n"
+            "  [bold]Shift+Tab[/bold]  - Cycle between modes\n"
+            "  /mode        - Show current mode\n"
+            "  /mode <name> - Switch to specific mode\n"
+            "  /modes       - List all available modes\n\n"
             "Commands:\n"
-            "  /model         - Show current model\n"
-            "  /model <name>  - Switch to a different model\n"
-            "  /models        - List available Ollama models\n"
-            "  /clear         - Clear conversation history\n"
-            "  /stats         - Show knowledge base stats\n"
-            "  /help          - Show help\n"
-            "  /quit          - Exit",
+            "  /plan [task]     - Plan and execute a multi-step task\n"
+            "  /model           - Show current model\n"
+            "  /model <name>    - Switch to a different model\n"
+            "  /models          - List available Ollama models\n"
+            "  /context         - Show context window size\n"
+            "  /context <size>  - Set context window size\n"
+            "  /clear           - Clear conversation history\n"
+            "  /stats           - Show knowledge base stats\n"
+            "  /help            - Show help\n"
+            "  /quit            - Exit\n\n"
+            "Shell commands:\n"
+            "  !<command>     - Execute shell command (e.g., !ls, !pwd)",
             title="Welcome",
         )
     )
 
+    last_interrupt_time = 0.0
+
+    # Try to use prompt_toolkit for better key binding support
+    prompt_session = _create_prompt_session(agent)
+
     while True:
         try:
-            user_input = Prompt.ask("\n[bold cyan]You[/bold cyan]")
+            # Get current mode for prompt
+            current_mode = agent.get_mode()
+            mode_color = _get_mode_color(current_mode)
+            prompt_color = _get_prompt_color(current_mode)
+
+            if prompt_session:
+                # Use prompt_toolkit with key bindings
+                from prompt_toolkit.formatted_text import HTML
+                prompt_text = HTML(f'<b><style fg="{prompt_color}">[{current_mode.value}]</style></b> > ')
+                user_input = prompt_session.prompt(prompt_text)
+            else:
+                # Fallback to basic input
+                console.print(f"[bold {mode_color}][{current_mode.value}][/bold {mode_color}] > ", end="")
+                user_input = input()
+
+            # Handle mode switch special case
+            if user_input == '__MODE_SWITCH__':
+                continue
 
             if not user_input.strip():
                 continue
@@ -110,9 +535,19 @@ def chat(
             _process_query(agent, user_input)
 
         except KeyboardInterrupt:
-            console.print("\n[yellow]Interrupted. Type /quit to exit.[/yellow]")
+            current_time = time.time()
+            if current_time - last_interrupt_time < 2.0:
+                # Double Ctrl+C within 2 seconds - exit
+                console.print("\n")
+                break
+            last_interrupt_time = current_time
+            console.print("\n[yellow]Press Ctrl+C again to exit.[/yellow]")
         except EOFError:
             break
+
+    # Display session stats
+    if _session_stats and _session_stats.queries > 0:
+        _session_stats.display(console)
 
     console.print("\n[cyan]Goodbye![/cyan]")
 
@@ -147,6 +582,9 @@ def query(
     model: str = typer.Option(
         None, "--model", "-m", help="Ollama model to use (e.g., mistral:7b, deepseek-r1:7b)"
     ),
+    mode: str = typer.Option(
+        None, "--mode", help="Agent mode (chat, plan, ask, execute, code, image, research, debug, creative)"
+    ),
 ) -> None:
     """Process a single query and exit."""
     from src.agent import Agent
@@ -157,10 +595,18 @@ def query(
         agent.set_model(model)
         console.print(f"[dim]Using model: {model}[/dim]")
 
+    if mode:
+        mode_enum = get_mode_by_name(mode)
+        if mode_enum:
+            agent.set_mode(mode_enum)
+            console.print(f"[dim]Using mode: {mode}[/dim]")
+        else:
+            console.print(f"[yellow]Unknown mode '{mode}', using default[/yellow]")
+
     result = agent.query(text, include_history=not no_history)
 
     console.print(Panel(result["response"], title="Response"))
-    console.print(f"[dim]Provider: {result['provider']} | Documents: {result['documents_used']}[/dim]")
+    console.print(f"[dim]Provider: {result['provider']} | Mode: {result.get('mode', 'chat')} | Documents: {result['documents_used']}[/dim]")
 
 
 @app.command()
@@ -199,6 +645,7 @@ def check() -> None:
 def _process_query(agent, query: str) -> None:
     """Process a query and display the response."""
     result = None
+    error = None
     start_time = time.time()
 
     # Set up status handler to capture processing steps
@@ -211,8 +658,11 @@ def _process_query(agent, query: str) -> None:
     llm_logger.setLevel(logging.INFO)
 
     def run_query():
-        nonlocal result
-        result = agent.query(query)
+        nonlocal result, error
+        try:
+            result = agent.query(query)
+        except Exception as e:
+            error = e
 
     # Run query in background thread
     thread = threading.Thread(target=run_query)
@@ -244,6 +694,28 @@ def _process_query(agent, query: str) -> None:
     agent_logger.removeHandler(status_handler)
     llm_logger.removeHandler(status_handler)
 
+    # Handle errors from the query thread
+    if error is not None:
+        error_msg = str(error)
+        if "not found" in error_msg and "pulling" in error_msg:
+            # Missing model error
+            console.print(f"\n[bold red]Error:[/bold red] {error_msg}")
+            console.print("[yellow]Hint:[/yellow] Run `ollama pull <model-name>` to download the model")
+        elif "Connection refused" in error_msg or "not available" in error_msg.lower():
+            console.print(f"\n[bold red]Error:[/bold red] Cannot connect to Ollama")
+            console.print("[yellow]Hint:[/yellow] Make sure Ollama is running: `ollama serve`")
+        else:
+            console.print(f"\n[bold red]Error:[/bold red] {error_msg}")
+        if _session_stats:
+            _session_stats.record_error()
+        return
+
+    if result is None:
+        console.print("\n[bold red]Error:[/bold red] Query failed with no result")
+        if _session_stats:
+            _session_stats.record_error()
+        return
+
     response_text = result["response"]
 
     # Check if agent is asking for clarification
@@ -252,6 +724,10 @@ def _process_query(agent, query: str) -> None:
         console.print(f"\n[bold yellow]Clarification needed:[/bold yellow] {clarify_question}")
         clarification = Prompt.ask("[bold cyan]Your answer[/bold cyan]")
 
+        # Record clarification stat
+        if _session_stats:
+            _session_stats.record_clarification()
+
         # Run follow-up query with clarification
         follow_up = f"{query} (Clarification: {clarification})"
         console.print()
@@ -259,14 +735,21 @@ def _process_query(agent, query: str) -> None:
         return
 
     console.print("\n[bold green]Agent[/bold green]")
-    console.print(Markdown(response_text))
+
+    # For shell commands, preserve raw output formatting; for others use Markdown
+    if result["provider"] == "shell":
+        console.print(response_text)
+    else:
+        console.print(Markdown(response_text))
 
     # Determine grounding status
-    is_local_provider = result["provider"] in ("ollama", "local")
+    is_local_provider = result["provider"] in ("ollama", "local", "shell")
     has_kb_docs = result["documents_used"] > 0
     has_tools = len(result["tool_results"]) > 0
 
-    if has_kb_docs or has_tools:
+    if result["provider"] == "shell":
+        grounding = "[cyan]Shell[/cyan]"
+    elif has_kb_docs or has_tools:
         # Grounded response (KB or tools)
         if has_kb_docs and has_tools:
             grounding = "[green]Grounded[/green] (KB + Tools)"
@@ -285,9 +768,307 @@ def _process_query(agent, query: str) -> None:
         meta_parts.append(f"Docs: {result['documents_used']}")
     if result["tool_results"]:
         meta_parts.append(f"Tools: {len(result['tool_results'])}")
+
+    # Add model name
+    if result["provider"] != "shell":
+        if is_local_provider:
+            current_model = agent.get_model()
+            meta_parts.append(f"Model: {current_model}")
+        else:
+            # External provider - show provider name as model
+            meta_parts.append(f"Model: {result['provider']}")
+
+    # Add token usage and context window info
+    tokens = result.get("tokens_used", 0)
+    input_tokens = result.get("input_tokens", 0)
+    output_tokens = result.get("output_tokens", 0)
+
+    if tokens and _session_stats and _session_stats.context_window_size:
+        percentage = (tokens / _session_stats.context_window_size) * 100
+        if input_tokens and output_tokens:
+            meta_parts.append(f"Tokens: {tokens:,} ({percentage:.1f}%) [↓{input_tokens:,} ↑{output_tokens:,}]")
+        else:
+            meta_parts.append(f"Tokens: {tokens:,} ({percentage:.1f}%)")
+
     meta_parts.append(f"Time: {elapsed_total:.1f}s")
 
     console.print(f"[dim]{' | '.join(meta_parts)}[/dim]")
+
+    # Record session stats
+    if _session_stats:
+        _session_stats.record_query(result, elapsed_total)
+
+
+def _execute_command(agent, cmd: str) -> dict:
+    """
+    Execute a shell command and return the result.
+    Returns dict with 'output', 'success', 'blocked', 'error'.
+    """
+    result = agent.query(f"!{cmd}")
+    response = result.get("response", "")
+
+    is_blocked = "[BLOCKED]" in response
+    is_error = "[EXIT CODE:" in response and "[EXIT CODE: 0]" not in response
+    is_permission_denied = "permission denied" in response.lower() or "Operation not permitted" in response
+
+    return {
+        "command": cmd,
+        "output": response,
+        "success": not is_blocked and not is_error,
+        "blocked": is_blocked,
+        "permission_denied": is_permission_denied,
+        "error": is_error,
+    }
+
+
+def _handle_plan_mode(agent, task: str) -> None:
+    """
+    Handle planning mode - generate a plan, get approval, then execute.
+    """
+    import re
+    from src.llm.selector import ProviderSelector
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    console.print(f"\n[bold cyan]Planning:[/bold cyan] {task}\n")
+
+    # Track planning time
+    plan_start = time.time()
+
+    # Generate the plan
+    selector = ProviderSelector()
+
+    plan_prompt = f"""Create a step-by-step plan to accomplish this task: {task}
+
+STRICT FORMAT RULES:
+1. Output ONLY a numbered list (1. 2. 3. etc.)
+2. For ANY step involving a shell command, format EXACTLY as: $command - description
+3. The $ prefix is REQUIRED for all commands - this is how they get executed
+4. Keep it concise: 3-7 steps maximum
+5. Use actual executable commands, not descriptions of commands
+
+CORRECT format examples:
+1. $uptime - check system uptime
+2. $free -h - check memory usage
+3. $df -h - check disk space
+4. $top -bn1 | head -20 - check CPU usage
+5. $ip addr - check network interfaces
+6. $journalctl -n 50 --no-pager - check recent logs
+
+WRONG format (DO NOT USE):
+- "Check CPU with top command" (missing $ prefix)
+- "Run the free command" (missing $ prefix)
+- "Use df -h to check disk" (missing $ prefix)
+
+Task: {task}"""
+
+    messages = [
+        SystemMessage(content="You are a plan generator. Output ONLY numbered steps. For shell commands, ALWAYS use the format: $command - description. Never describe commands without the $ prefix."),
+        HumanMessage(content=plan_prompt),
+    ]
+
+    console.print("[dim]Generating plan...[/dim]")
+    result = selector.generate(messages, force_local=True)
+    plan_text = result.content.strip()
+    plan_time = time.time() - plan_start
+
+    # Display the plan
+    console.print(Panel(plan_text, title=f"[bold]Proposed Plan[/bold] [dim](generated in {plan_time:.1f}s)[/dim]", border_style="cyan"))
+
+    # Get user approval
+    console.print("\n[bold]Options:[/bold]")
+    console.print("  [green]y/Enter[/green] - Approve and execute (step by step)")
+    console.print("  [green]a[/green]       - Approve and execute all (no prompts)")
+    console.print("  [red]n[/red]       - Cancel")
+    console.print("  [yellow]e[/yellow]       - Edit task and regenerate")
+
+    choice = Prompt.ask("\n[bold cyan]Your choice[/bold cyan]", default="y").strip()
+
+    if choice.lower() == "n":
+        console.print("[yellow]Plan cancelled.[/yellow]")
+        return
+
+    # Handle edit - either "e" alone or "e <new task>"
+    if choice.lower() == "e" or choice.lower().startswith("e "):
+        if choice.lower().startswith("e "):
+            new_task = choice[2:].strip()
+        else:
+            new_task = Prompt.ask("[bold cyan]Enter modified task[/bold cyan]")
+        if new_task.strip():
+            _handle_plan_mode(agent, new_task.strip())
+        return
+
+    # Determine execution mode
+    run_all = choice.lower() == "a"
+
+    # Execute the plan
+    console.print("\n[bold green]Executing plan...[/bold green]\n")
+    exec_start = time.time()
+
+    # Parse steps from the plan
+    steps = re.findall(r'^\d+\.\s*(.+)$', plan_text, re.MULTILINE)
+    if not steps:
+        steps = [line.strip() for line in plan_text.split('\n') if line.strip() and line.strip()[0].isdigit()]
+        steps = [re.sub(r'^\d+\.\s*', '', s) for s in steps]
+
+    # Collect results for post-execution report
+    execution_results = []
+    stopped_early = False
+
+    for i, step in enumerate(steps, 1):
+        console.print(f"\n[bold cyan]Step {i}/{len(steps)}:[/bold cyan] {step}")
+
+        # Check if step contains a shell command (marked with $)
+        cmd_match = re.search(r'\$\s*(.+)', step)
+        if cmd_match:
+            cmd = cmd_match.group(1).strip()
+            if ' - ' in cmd:
+                cmd = cmd.split(' - ')[0].strip()
+            console.print(f"[dim]Running: {cmd}[/dim]")
+
+            # Execute and capture result
+            cmd_result = _execute_command(agent, cmd)
+
+            # Display output
+            if cmd_result["blocked"]:
+                console.print(f"[yellow]⚠ Command blocked[/yellow]")
+            elif cmd_result["success"]:
+                console.print(cmd_result["output"])
+            else:
+                console.print(cmd_result["output"])
+
+            # Handle blocked or permission denied - offer sudo retry
+            needs_sudo_retry = (
+                cmd_result["blocked"] or
+                cmd_result["permission_denied"]
+            )
+            if needs_sudo_retry and not cmd.startswith("sudo "):
+                retry = Prompt.ask(
+                    "[yellow]Retry with sudo?[/yellow] [y/n]",
+                    default="y"
+                ).strip().lower()
+                if retry == "y":
+                    console.print(f"[dim]Running: sudo {cmd}[/dim]")
+                    cmd_result = _execute_command(agent, f"sudo {cmd}")
+                    if cmd_result["blocked"]:
+                        console.print(f"[yellow]⚠ Command still blocked[/yellow]")
+                    else:
+                        console.print(cmd_result["output"])
+
+            execution_results.append({
+                "step": i,
+                "description": step,
+                "command": cmd,
+                "result": cmd_result,
+            })
+        else:
+            # Non-command step - process as query
+            _process_query(agent, step)
+            execution_results.append({
+                "step": i,
+                "description": step,
+                "command": None,
+                "result": {"success": True, "output": "Processed as query"},
+            })
+
+        # Prompt between steps (unless run_all mode)
+        if not run_all and i < len(steps):
+            continue_choice = Prompt.ask(
+                "[dim]Enter=continue, 's'=skip remaining, 'q'=quit[/dim]",
+                default=""
+            ).strip().lower()
+            if continue_choice == "q":
+                console.print("[yellow]Plan execution stopped.[/yellow]")
+                stopped_early = True
+                break
+            if continue_choice == "s":
+                console.print("[yellow]Skipping remaining steps.[/yellow]")
+                stopped_early = True
+                break
+
+    exec_time = time.time() - exec_start
+
+    # Generate post-execution report
+    console.print("\n" + "=" * 60)
+    console.print("[bold]Execution Report[/bold]")
+    console.print("=" * 60)
+
+    # Summary stats
+    completed = len(execution_results)
+    successful = sum(1 for r in execution_results if r["result"].get("success", False))
+    blocked = sum(1 for r in execution_results if r["result"].get("blocked", False))
+    failed = completed - successful - blocked
+
+    console.print(f"\n[bold]Summary:[/bold]")
+    console.print(f"  Steps completed: {completed}/{len(steps)}")
+    console.print(f"  [green]Successful: {successful}[/green]")
+    if blocked > 0:
+        console.print(f"  [yellow]Blocked: {blocked}[/yellow]")
+    if failed > 0:
+        console.print(f"  [red]Failed: {failed}[/red]")
+    console.print(f"  Planning time: {plan_time:.1f}s")
+    console.print(f"  Execution time: {exec_time:.1f}s")
+
+    # Collect outputs for analysis (truncate to keep analysis fast)
+    MAX_OUTPUT_PER_COMMAND = 2000  # chars per command output
+    outputs_for_analysis = []
+    for r in execution_results:
+        if r["command"] and r["result"].get("output"):
+            output = r["result"]["output"]
+            # Clean up the output (remove the $ command prefix line)
+            if output.startswith("$ "):
+                lines = output.split("\n", 1)
+                if len(lines) > 1:
+                    output = lines[1]
+            # Truncate long outputs to speed up analysis
+            if len(output) > MAX_OUTPUT_PER_COMMAND:
+                output = output[:MAX_OUTPUT_PER_COMMAND] + f"\n... (truncated {len(output) - MAX_OUTPUT_PER_COMMAND} chars)"
+            outputs_for_analysis.append(f"[{r['description']}]\n{output}")
+
+    # Analyze results if we have command outputs
+    if outputs_for_analysis and not stopped_early:
+        console.print(f"\n[bold]Analysis:[/bold]")
+        analysis_start = time.time()
+
+        # Show spinner while analyzing
+        with console.status("[dim]Analyzing results...[/dim]", spinner="dots"):
+            analysis_prompt = f"""Based on the following command outputs from a "{task}" task, provide a brief analysis:
+
+{chr(10).join(outputs_for_analysis)}
+
+Provide:
+1. A brief overall assessment (1-2 sentences)
+2. Any issues or warnings noticed (bullet points)
+3. Recommendations if any (bullet points)
+4. A single follow-up question to help guide next steps (start with "Would you like to...")
+
+Be concise and focus on actionable insights."""
+
+            analysis_messages = [
+                SystemMessage(content="You are a system administrator analyzing command outputs. Be concise and practical. Always end with a helpful follow-up question."),
+                HumanMessage(content=analysis_prompt),
+            ]
+
+            try:
+                analysis_result = selector.generate(analysis_messages, force_local=True)
+                analysis_time = time.time() - analysis_start
+                console.print(f"[dim](analyzed in {analysis_time:.1f}s)[/dim]\n")
+                console.print(Markdown(analysis_result.content))
+
+                # Add plan results to conversation history for follow-up questions
+                from langchain_core.messages import HumanMessage as HM, AIMessage as AM
+                plan_summary = f"Plan executed: {task}\n\nResults:\n" + chr(10).join(outputs_for_analysis[:3])  # First 3 outputs
+                agent._conversation_history.extend([
+                    HM(content=f"/plan {task}"),
+                    AM(content=f"[Plan executed with {successful} successful, {blocked} blocked steps]\n\nAnalysis:\n{analysis_result.content}"),
+                ])
+            except Exception as e:
+                console.print(f"[yellow]Could not generate analysis: {e}[/yellow]")
+
+    # Record plan execution in session stats
+    if _session_stats:
+        _session_stats.record_plan()
+
+    console.print("\n[bold green]Plan completed![/bold green]")
 
 
 def _handle_command(command: str, agent) -> bool:
@@ -308,17 +1089,13 @@ def _handle_command(command: str, agent) -> bool:
         return True
 
     if cmd_lower == "/models":
-        models = agent.list_models()
-        current = agent.get_model()
-        if models:
-            console.print("[bold]Available Ollama models:[/bold]")
-            for model in models:
-                if model == current:
-                    console.print(f"  [green]* {model}[/green] (current)")
-                else:
-                    console.print(f"    {model}")
-        else:
-            console.print("[yellow]No models found. Is Ollama running?[/yellow]")
+        # Interactive model selector
+        selected = _interactive_model_selector(agent)
+        if selected:
+            agent.set_model(selected)
+            console.print(f"[green]Switched to model: {selected}[/green]")
+            # Save state
+            _save_state(selected, agent.get_mode().value)
         return True
 
     if cmd_lower == "/model":
@@ -348,6 +1125,8 @@ def _handle_command(command: str, agent) -> bool:
 
         agent.set_model(model_name)
         console.print(f"[green]Switched to model: {model_name}[/green]")
+        # Save state
+        _save_state(model_name, agent.get_mode().value)
         return True
 
     if cmd_lower == "/stats":
@@ -358,19 +1137,132 @@ def _handle_command(command: str, agent) -> bool:
         console.print(f"Documents in KB: {stats['document_count']}")
         console.print(f"Conversation history: {agent.get_history_length()} messages")
         console.print(f"Current model: {agent.get_model()}")
+        console.print(f"Current mode: {agent.get_mode().value}")
+        console.print(f"Context window: {agent.get_context_window():,} tokens")
+        return True
+
+    if cmd_lower == "/context":
+        current_ctx = agent.get_context_window()
+        console.print(f"Current context window: [cyan]{current_ctx:,}[/cyan] tokens")
+        console.print("\nCommon sizes:")
+        console.print("  4096   - Small (faster, less memory)")
+        console.print("  8192   - Default (balanced)")
+        console.print("  16384  - Large (more history)")
+        console.print("  32768  - Very large (long conversations)")
+        console.print("  65536  - Huge (maximum history)")
+        console.print("\n[dim]Use /context <size> to change[/dim]")
+        return True
+
+    if cmd_lower.startswith("/context "):
+        size_str = cmd[9:].strip()
+        if not size_str:
+            console.print("[yellow]Usage: /context <size>[/yellow]")
+            return True
+
+        try:
+            new_size = int(size_str.replace(",", "").replace("_", ""))
+            agent.set_context_window(new_size)
+            console.print(f"[green]Context window set to {new_size:,} tokens[/green]")
+            console.print("[yellow]Note: This will take effect on the next query[/yellow]")
+            # Update session stats
+            if _session_stats:
+                _session_stats.context_window_size = new_size
+        except ValueError as e:
+            console.print(f"[red]Error:[/red] {e}")
+        return True
+
+    if cmd_lower == "/mode":
+        current_mode = agent.get_mode()
+        mode_config = get_mode_config(current_mode)
+        mode_color = _get_mode_color(current_mode)
+        console.print(f"Current mode: [{mode_color}]{current_mode.value}[/{mode_color}]")
+        console.print(f"Description: {mode_config.description}")
+        console.print(f"Routing bias: {mode_config.routing_bias or 'balanced'}")
+        console.print(f"Temperature: {mode_config.temperature}")
+        console.print(f"Verbose: {mode_config.verbose}")
+        return True
+
+    if cmd_lower.startswith("/mode "):
+        mode_name = cmd[6:].strip()
+        if not mode_name:
+            console.print("[yellow]Usage: /mode <mode_name>[/yellow]")
+            return True
+
+        mode_enum = get_mode_by_name(mode_name)
+        if mode_enum:
+            agent.set_mode(mode_enum)
+            mode_config = get_mode_config(mode_enum)
+            mode_color = _get_mode_color(mode_enum)
+            console.print(f"[{mode_color}]→ {mode_enum.value}[/{mode_color}] [dim]{mode_config.description}[/dim]")
+            # Save state
+            _save_state(agent.get_model(), mode_enum.value)
+        else:
+            console.print(f"[yellow]Unknown mode: {mode_name}[/yellow]")
+            console.print("Use /modes to see available modes.")
+        return True
+
+    if cmd_lower == "/modes":
+        console.print("[bold]Available modes:[/bold]")
+        console.print("  Use [bold]Shift+Tab[/bold] to cycle or [bold]/mode <name>[/bold] to switch\n")
+
+        current_mode = agent.get_mode()
+        for mode, description in list_modes():
+            mode_color = _get_mode_color(mode)
+            if mode == current_mode:
+                console.print(f"  [{mode_color}]* {mode.value:10}[/{mode_color}] - {description} [dim](current)[/dim]")
+            else:
+                console.print(f"    [{mode_color}]{mode.value:10}[/{mode_color}] - {description}")
+        return True
+
+    if cmd_lower == "/plan" or cmd_lower.startswith("/plan "):
+        # Extract task description if provided
+        task = cmd[5:].strip() if len(cmd) > 5 else ""
+        if not task:
+            task = Prompt.ask("[bold cyan]What would you like to plan?[/bold cyan]")
+            if not task.strip():
+                console.print("[yellow]No task provided.[/yellow]")
+                return True
+
+        _handle_plan_mode(agent, task)
         return True
 
     if cmd_lower == "/help":
         console.print(
             Panel(
+                "Mode commands:\n"
+                "  [bold]Shift+Tab[/bold]    - Cycle between modes\n"
+                "  /mode          - Show current mode\n"
+                "  /mode <name>   - Switch to specific mode\n"
+                "  /modes         - List all available modes\n\n"
                 "Available commands:\n"
-                "  /model         - Show current model\n"
-                "  /model <name>  - Switch to a different model\n"
-                "  /models        - List available Ollama models\n"
-                "  /clear         - Clear conversation history\n"
-                "  /stats         - Show knowledge base and conversation stats\n"
-                "  /help          - Show this help message\n"
-                "  /quit          - Exit the chat",
+                "  /plan [task]     - Enter planning mode to create and execute a plan\n"
+                "  /model           - Show current model\n"
+                "  /model <name>    - Switch to a different model\n"
+                "  /models          - List available Ollama models\n"
+                "  /context         - Show/modify context window size\n"
+                "  /context <size>  - Set context window (e.g., 4096, 8192, 32768)\n"
+                "  /clear           - Clear conversation history\n"
+                "  /stats           - Show knowledge base and conversation stats\n"
+                "  /help            - Show this help message\n"
+                "  /quit            - Exit the chat\n\n"
+                "Shell commands:\n"
+                "  !<command>     - Execute a shell command directly\n"
+                "                   Examples: !ls, !pwd, !cat file.txt\n\n"
+                "Modes:\n"
+                "  chat     - General conversation (default)\n"
+                "  plan     - Multi-step task planning\n"
+                "  ask      - Knowledge retrieval\n"
+                "  execute  - Tool/bash execution\n"
+                "  code     - Programming assistance\n"
+                "  image    - Image generation (requires SD)\n"
+                "  research - Web search and synthesis\n"
+                "  debug    - Verbose tracing\n"
+                "  creative - High creativity responses\n\n"
+                "Tips:\n"
+                "  - The agent will ask for clarification when queries are ambiguous\n"
+                "  - Use ! prefix to run commands without LLM interpretation\n"
+                "  - Use /plan to break complex tasks into steps before execution\n"
+                "  - Different modes optimize routing for specific tasks",
                 title="Help",
             )
         )
