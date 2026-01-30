@@ -9,6 +9,7 @@ class AgentMode(str, Enum):
 
     CHAT = "chat"
     PLAN = "plan"
+    AGENTIC = "agentic"
     ASK = "ask"
     EXECUTE = "execute"
     CODE = "code"
@@ -54,6 +55,18 @@ MODE_CONFIGS: dict[AgentMode, ModeConfig] = {
         verbose=False,
         tool_permissions="normal",
     ),
+    AgentMode.AGENTIC: ModeConfig(
+        name=AgentMode.AGENTIC,
+        description="Agentic loop with compact state and tool orchestration",
+        routing_bias=None,
+        temperature=0.2,
+        system_prompt_modifier=(
+            "You are an agentic controller. Choose one action per step and "
+            "keep state updates concise."
+        ),
+        verbose=False,
+        tool_permissions="elevated",
+    ),
     AgentMode.ASK: ModeConfig(
         name=AgentMode.ASK,
         description="Knowledge retrieval - prioritizes KB search",
@@ -84,8 +97,16 @@ MODE_CONFIGS: dict[AgentMode, ModeConfig] = {
         routing_bias="generate",
         temperature=0.3,
         system_prompt_modifier=(
-            "You are an expert programmer. Write clean, well-documented code. "
-            "Follow best practices and explain your reasoning when helpful."
+            "You are an expert programmer. When the user asks to create or update files, "
+            "respond ONLY with file blocks in this exact format:\n"
+            "FILE: relative/path.ext\n"
+            "```lang\n"
+            "<full file content>\n"
+            "```\n"
+            "Only include files that should be created or updated. Use project-root-relative paths. "
+            "If a reasonable default path exists (e.g., index.html for a landing page), use it. "
+            "If you need a path or clarification, ask a short question instead of outputting code. "
+            "For purely conceptual questions, answer normally."
         ),
         verbose=False,
         tool_permissions="normal",
@@ -143,6 +164,7 @@ MODE_CONFIGS: dict[AgentMode, ModeConfig] = {
 MODE_CYCLE_ORDER = [
     AgentMode.CHAT,
     AgentMode.PLAN,
+    AgentMode.AGENTIC,
     AgentMode.ASK,
     AgentMode.EXECUTE,
     AgentMode.CODE,

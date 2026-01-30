@@ -45,12 +45,13 @@ This is a local-first LLM agent using LangGraph for workflow orchestration. The 
 
 ### Mode System
 
-The agent supports 9 modes, each optimizing routing and behavior for specific tasks:
+The agent supports 10 modes, each optimizing routing and behavior for specific tasks:
 
 | Mode | Purpose | Routing Bias | Temperature |
 |------|---------|--------------|-------------|
 | **chat** (default) | General conversation | Balanced | 0.7 |
 | **plan** | Multi-step task planning | generate | 0.3 |
+| **agentic** | Agentic loop control | Balanced | 0.2 |
 | **ask** | KB retrieval + knowledge | retrieve | 0.5 |
 | **execute** | Tool/bash execution | tool | 0.3 |
 | **code** | Programming assistance | generate | 0.3 |
@@ -80,12 +81,27 @@ The agent can request clarification when queries are ambiguous. Responses starti
 - **`src/agent/graph.py`** - LangGraph StateGraph definition with conditional edges for routing decisions
 - **`src/agent/state.py`** - `AgentStateDict` TypedDict that flows through the graph, includes mode
 - **`src/agent/modes.py`** - Mode definitions, configs, and cycling logic
+- **`src/agent/agentic_loop.py`** - Agentic loop with persistent state and tool orchestration
+- **Agentic health summaries** - Deterministic summary for standard health commands (uptime/df/free/ps)
+- **Agentic codebase summaries** - Deterministic overview when reading README/AGENTS/CLAUDE
+- **Agentic JSON retry** - Retries once if model output isn't valid JSON
+- **Agentic no-match guard** - Stops repeated empty searches and suggests a review workflow
+- **Agentic bootstrap** - Reads README/AGENTS/CLAUDE for repo overview questions before LLM
+- **Agentic multi-goal** - Splits tasks on "then/and then/after that" and runs goals sequentially
+- **Agentic commas** - Splits chained prompts on commas when phrased as multiple tasks
+- **Agentic tool validation** - Rejects malformed tool args and retries
+- **Agentic review bootstrap** - Starts code review goals with TODO/FIXME/BUG scan
+- **Agentic pytest bootstrap** - Runs pytest once for test-related goals and summarizes output
+- **Agentic TTS bootstrap** - Generates audio for TTS goals, stores last output path, and plays via available system tools (non-blocking)
+- **Agentic timing** - Logs tool/step durations for better visibility
 - **`src/llm/selector.py`** - Provider selection logic; tries Ollama first, estimates confidence, triggers fallback chain via LiteLLM
 - **`src/llm/local.py`** - Ollama wrapper with confidence estimation based on uncertainty phrases
 - **`src/knowledge/vectorstore.py`** - ChromaDB wrapper with content-hash deduplication
 - **`src/tools/bash.py`** - Sandboxed bash execution with blocked command patterns and approval flow
+- **`src/tools/registry.py`** - Tool registry (bash, read_file, list_dir, search, write_file, tts service fallback)
 - **`src/tools/web.py`** - Web search via DuckDuckGo or SearXNG
 - **`src/tools/image.py`** - Image generation via ComfyUI or Automatic1111
+- **`.agent/`** - Agentic loop state, logs, and scratch outputs
 
 ### Configuration
 
@@ -95,10 +111,13 @@ The agent can request clarification when queries are ambiguous. Responses starti
 ### Interfaces
 
 - **CLI**: `scripts/run.py` (Typer) - chat, serve, query, check commands
-  - Runtime model switching: `/model <name>` or `--model` flag
+  - Runtime model switching: `/model <name>` or `--model` flag (applies to planner/agentic helpers)
+  - Project root defaults to cwd for CLI; override with `--project-root` or `PROJECT_ROOT`
+  - Code mode auto-applies `FILE:` blocks to disk
   - Mode cycling: `Shift+Tab` or `/mode <name>`
   - Shell commands: `!command` prefix for direct execution
   - Plan mode: `/plan [task]` for multi-step task planning
+  - Agentic mode: `/mode agentic` for multi-step tool orchestration (step or auto approval)
 - **API**: `src/api/routes.py` (FastAPI) - /api/v1/query, /api/v1/ingest/*, /api/v1/kb/*, /api/v1/model
 
 ## Development Workflow

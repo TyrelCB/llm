@@ -1,6 +1,8 @@
 """Main entry point for the LLM agent."""
 
 import logging
+import os
+import re
 import sys
 import time
 import threading
@@ -23,10 +25,10 @@ if "chat" in sys.argv:
     sys.stderr.write("Launching chat (loading CLI)...\n")
     sys.stderr.flush()
 
-from config.settings import settings
+from config.settings import settings, configure_project_root
 from src.agent.modes import AgentMode, get_mode_config, get_next_mode, list_modes, get_mode_by_name
 
-__version__ = "0.6.0"
+__version__ = "0.8.7"
 logger = logging.getLogger(__name__)
 
 
@@ -193,11 +195,95 @@ app = typer.Typer(
 console = Console()
 
 
+@app.callback()
+def _configure_project(
+    project_root: Path | None = typer.Option(
+        None,
+        "--project-root",
+        "-p",
+        help="Project root for file tools and local data (defaults to cwd if not set).",
+    ),
+) -> None:
+    """Configure project root for CLI runs."""
+    root = project_root
+    if root is None:
+        if os.getenv("PROJECT_ROOT"):
+            root = settings.project_root
+        else:
+            root = Path.cwd()
+    configure_project_root(root)
+
+
+def _extract_file_blocks(response: str) -> list[dict[str, str]]:
+    """Extract FILE blocks from a code-mode response."""
+    lines = response.splitlines()
+    blocks: list[dict[str, str]] = []
+    i = 0
+    while i < len(lines):
+        match = re.match(r"^\s*FILE:\s*(.+)\s*$", lines[i])
+        if not match:
+            i += 1
+            continue
+        path = match.group(1).strip()
+        i += 1
+        if i >= len(lines) or not lines[i].lstrip().startswith("```"):
+            continue
+        i += 1
+        content_lines: list[str] = []
+        while i < len(lines) and not lines[i].lstrip().startswith("```"):
+            content_lines.append(lines[i])
+            i += 1
+        if i < len(lines) and lines[i].lstrip().startswith("```"):
+            i += 1
+        blocks.append({"path": path, "content": "\n".join(content_lines)})
+    return blocks
+
+
+def _apply_file_blocks(blocks: list[dict[str, str]]) -> list[dict[str, str | bool]]:
+    """Apply file blocks using the write_file tool."""
+    if not blocks:
+        return []
+    from src.tools.registry import ToolRegistry
+    registry = ToolRegistry()
+    results: list[dict[str, str | bool]] = []
+    for block in blocks:
+        output = registry.execute(
+            "write_file",
+            {"path": block["path"], "content": block["content"], "mode": "overwrite"},
+        )
+        success = output.startswith("[OK]")
+        results.append(
+            {
+                "path": block["path"],
+                "success": success,
+                "message": output,
+            }
+        )
+    return results
+
+
+def _render_apply_summary(results: list[dict[str, str | bool]]) -> str:
+    """Render a short summary of applied file changes."""
+    if not results:
+        return ""
+    applied = [r for r in results if r["success"]]
+    failed = [r for r in results if not r["success"]]
+    lines = [f"Applied {len(applied)} file(s):"]
+    for item in applied:
+        lines.append(f"- `{item['path']}`")
+    if failed:
+        lines.append("\nErrors:")
+        for item in failed:
+            lines.append(f"- `{item['path']}`: {item['message']}")
+    return "\n".join(lines)
+
+
 def _get_mode_color(mode: AgentMode) -> str:
     """Get the display color for a mode."""
     colors = {
         AgentMode.CHAT: "cyan",
         AgentMode.PLAN: "yellow",
+        AgentMode.AGENTIC: "bright_magenta",
         AgentMode.ASK: "green",
         AgentMode.EXECUTE: "red",
         AgentMode.CODE: "magenta",
@@ -214,6 +300,7 @@ def _get_prompt_color(mode: AgentMode) -> str:
     colors = {
         AgentMode.CHAT: "ansicyan",
         AgentMode.PLAN: "ansiyellow",
+        AgentMode.AGENTIC: "ansibrightmagenta",
         AgentMode.ASK: "ansigreen",
         AgentMode.EXECUTE: "ansired",
         AgentMode.CODE: "ansimagenta",
@@ -253,6 +340,64 @@ def _load_state() -> dict:
     except Exception as e:
         logger.warning(f"Failed to load state: {e}")
     return {}
+
+
+def _prompt_agentic_approval_mode(current: str | None = None) -> str:
+    """Prompt for agentic approval mode."""
+    default = current or settings.agentic_default_approval_mode
+    return Prompt.ask(
+        "[bold cyan]Agentic execution mode[/bold cyan] ([green]step[/green]/[green]auto[/green])",
+        choices=["step", "auto"],
+        default=default,
+    )
+
+
+def _agentic_step_approval(action: dict) -> bool:
+    """Request per-step approval for agentic actions."""
+    action_spec = action.get("action") or {}
+    tool = action_spec.get("tool", "unknown")
+    args = action_spec.get("args", {})
+    details = ""
+    if tool == "bash":
+        details = f" command={args.get('command', '')}"
+    elif tool == "read_file":
+        details = f" path={args.get('path', '')}"
+    elif tool == "write_file":
+        details = f" path={args.get('path', '')}"
+    elif tool == "search":
+        details = f" query={args.get('query', '')}"
+    elif tool == "ask_user":
+        details = f" question={args.get('question', '')}"
+    console.print(f"[yellow]Agentic step request:[/yellow] {tool}{details}")
+    choice = Prompt.ask("[bold cyan]Execute this step?[/bold cyan] [y/n]", default="y").strip().lower()
+    return choice == "y" or choice == ""
+
+
+def _agentic_bash_approval(command: str) -> bool:
+    """Request approval for potentially dangerous bash commands."""
+    console.print(f"[yellow]Bash approval required:[/yellow] {command}")
+    choice = Prompt.ask("[bold cyan]Approve command?[/bold cyan] [y/n]", default="n").strip().lower()
+    return choice == "y"
+
+
+def _agentic_ask_user(question: str) -> str:
+    """Prompt user for missing input during agentic runs."""
+    return Prompt.ask(f"[bold yellow]Agent needs info:[/bold yellow] {question}")
+
+
+def _agentic_step_result(action: dict, result: dict) -> None:
+    """Display the output from an agentic step."""
+    action_spec = action.get("action") or {}
+    tool = action_spec.get("tool", "unknown")
+    summary = result.get("summary", "") or result.get("output", "")
+    if summary:
+        tool_ms = result.get("tool_duration_ms", 0)
+        step_ms = result.get("step_duration_ms", 0)
+        timing = ""
+        if tool_ms or step_ms:
+            timing = f" [tool {tool_ms}ms, step {step_ms}ms]"
+        console.print(f"[dim]Step result ({tool}){timing}:[/dim]")
+        console.print(summary)
 
 
 def _interactive_model_selector(agent) -> str | None:
@@ -418,6 +563,12 @@ def chat(
     console.print("[dim]Initializing agent...[/dim]")
     agent = Agent()
     console.print(f"[dim]Initialization complete in {time.perf_counter() - init_start:.1f}s[/dim]")
+    agent.set_agentic_callbacks(
+        step_approval_callback=_agentic_step_approval,
+        step_result_callback=_agentic_step_result,
+        bash_approval_callback=_agentic_bash_approval,
+        ask_user_callback=_agentic_ask_user,
+    )
 
     # Load saved state (last model and mode)
     saved_state = _load_state()
@@ -444,6 +595,10 @@ def chat(
                 console.print(f"[dim]Restored model: {saved_state['model']}[/dim]")
         except Exception as e:
             logger.debug(f"Failed to restore model: {e}")
+
+    if not query and agent.get_mode() == AgentMode.AGENTIC:
+        approval_mode = _prompt_agentic_approval_mode(agent.get_agentic_approval_mode())
+        agent.set_agentic_approval_mode(approval_mode)
 
     if query:
         # Single query mode
@@ -479,6 +634,8 @@ def chat(
             "  /mode        - Show current mode\n"
             "  /mode <name> - Switch to specific mode\n"
             "  /modes       - List all available modes\n\n"
+            "Agentic:\n"
+            "  /mode agentic - Persistent multi-step loop (step or auto)\n\n"
             "Commands:\n"
             "  /plan [task]     - Plan and execute a multi-step task\n"
             "  /model           - Show current model\n"
@@ -520,6 +677,9 @@ def chat(
 
             # Handle mode switch special case
             if user_input == '__MODE_SWITCH__':
+                if agent.get_mode() == AgentMode.AGENTIC:
+                    approval_mode = _prompt_agentic_approval_mode(agent.get_agentic_approval_mode())
+                    agent.set_agentic_approval_mode(approval_mode)
                 continue
 
             if not user_input.strip():
@@ -647,6 +807,7 @@ def _process_query(agent, query: str) -> None:
     result = None
     error = None
     start_time = time.time()
+    is_agentic_mode = agent.get_mode() == AgentMode.AGENTIC
 
     # Set up status handler to capture processing steps
     status_handler = StatusHandler()
@@ -664,31 +825,35 @@ def _process_query(agent, query: str) -> None:
         except Exception as e:
             error = e
 
-    # Run query in background thread
-    thread = threading.Thread(target=run_query)
-    thread.start()
+    if is_agentic_mode:
+        run_query()
+        elapsed_total = time.time() - start_time
+    else:
+        # Run query in background thread
+        thread = threading.Thread(target=run_query)
+        thread.start()
 
-    # Show spinner with elapsed time and status
-    spinner_frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-    frame_idx = 0
-    with Live(console=console, refresh_per_second=10) as live:
-        while thread.is_alive():
-            elapsed = time.time() - start_time
-            spinner_text = Text()
-            spinner_text.append(f"{spinner_frames[frame_idx]} ", style="cyan")
-            spinner_text.append(f"Thinking... ", style="cyan")
-            spinner_text.append(f"({elapsed:.1f}s)", style="dim")
+        # Show spinner with elapsed time and status
+        spinner_frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+        frame_idx = 0
+        with Live(console=console, refresh_per_second=10) as live:
+            while thread.is_alive():
+                elapsed = time.time() - start_time
+                spinner_text = Text()
+                spinner_text.append(f"{spinner_frames[frame_idx]} ", style="cyan")
+                spinner_text.append(f"Thinking... ", style="cyan")
+                spinner_text.append(f"({elapsed:.1f}s)", style="dim")
 
-            # Show current processing step
-            if status_handler.current_status:
-                spinner_text.append(f"\n  {status_handler.current_status}", style="dim italic")
+                # Show current processing step
+                if status_handler.current_status:
+                    spinner_text.append(f"\n  {status_handler.current_status}", style="dim italic")
 
-            live.update(spinner_text)
-            frame_idx = (frame_idx + 1) % len(spinner_frames)
-            time.sleep(0.1)
+                live.update(spinner_text)
+                frame_idx = (frame_idx + 1) % len(spinner_frames)
+                time.sleep(0.1)
 
-    thread.join()
-    elapsed_total = time.time() - start_time
+        thread.join()
+        elapsed_total = time.time() - start_time
 
     # Clean up handlers
     agent_logger.removeHandler(status_handler)
@@ -718,6 +883,13 @@ def _process_query(agent, query: str) -> None:
 
     response_text = result["response"]
 
+    # Auto-apply code-mode file blocks
+    if agent.get_mode() == AgentMode.CODE and result.get("provider") != "shell":
+        file_blocks = _extract_file_blocks(response_text)
+        if file_blocks:
+            apply_results = _apply_file_blocks(file_blocks)
+            response_text = _render_apply_summary(apply_results)
+
     # Check if agent is asking for clarification
     if response_text.strip().startswith("CLARIFY:"):
         clarify_question = response_text.strip()[8:].strip()
@@ -743,12 +915,14 @@ def _process_query(agent, query: str) -> None:
         console.print(Markdown(response_text))
 
     # Determine grounding status
-    is_local_provider = result["provider"] in ("ollama", "local", "shell")
+    is_local_provider = result["provider"] in ("ollama", "local", "shell", "agentic")
     has_kb_docs = result["documents_used"] > 0
     has_tools = len(result["tool_results"]) > 0
 
     if result["provider"] == "shell":
         grounding = "[cyan]Shell[/cyan]"
+    elif result["provider"] == "agentic":
+        grounding = "[magenta]Agentic[/magenta]"
     elif has_kb_docs or has_tools:
         # Grounded response (KB or tools)
         if has_kb_docs and has_tools:
@@ -768,6 +942,8 @@ def _process_query(agent, query: str) -> None:
         meta_parts.append(f"Docs: {result['documents_used']}")
     if result["tool_results"]:
         meta_parts.append(f"Tools: {len(result['tool_results'])}")
+    if result.get("steps_executed"):
+        meta_parts.append(f"Steps: {result['steps_executed']}")
 
     # Add model name
     if result["provider"] != "shell":
@@ -1180,6 +1356,8 @@ def _handle_command(command: str, agent) -> bool:
         console.print(f"Routing bias: {mode_config.routing_bias or 'balanced'}")
         console.print(f"Temperature: {mode_config.temperature}")
         console.print(f"Verbose: {mode_config.verbose}")
+        if current_mode == AgentMode.AGENTIC:
+            console.print(f"Approval mode: {agent.get_agentic_approval_mode()}")
         return True
 
     if cmd_lower.startswith("/mode "):
@@ -1194,6 +1372,9 @@ def _handle_command(command: str, agent) -> bool:
             mode_config = get_mode_config(mode_enum)
             mode_color = _get_mode_color(mode_enum)
             console.print(f"[{mode_color}]→ {mode_enum.value}[/{mode_color}] [dim]{mode_config.description}[/dim]")
+            if mode_enum == AgentMode.AGENTIC:
+                approval_mode = _prompt_agentic_approval_mode(agent.get_agentic_approval_mode())
+                agent.set_agentic_approval_mode(approval_mode)
             # Save state
             _save_state(agent.get_model(), mode_enum.value)
         else:
@@ -1251,6 +1432,7 @@ def _handle_command(command: str, agent) -> bool:
                 "Modes:\n"
                 "  chat     - General conversation (default)\n"
                 "  plan     - Multi-step task planning\n"
+                "  agentic  - Persistent multi-step loop with tools\n"
                 "  ask      - Knowledge retrieval\n"
                 "  execute  - Tool/bash execution\n"
                 "  code     - Programming assistance\n"

@@ -2,31 +2,47 @@
 
 A local-first LLM agent with RAG-based knowledge base, tool execution, and intelligent fallback to external providers.
 
-## What's New in 0.6.0
+## What's New in 0.8.7
 
-- **🎯 9 Agent Modes**: Specialized modes for different tasks (research, code, creative, etc.)
-- **🔍 Web Research**: DuckDuckGo search with page content crawling and citation synthesis
-- **📊 Context Window Management**: Track token usage and adjust context window on-the-fly
-- **💾 Persistent State**: Remembers your last model and mode between sessions
-- **⌨️ Tab Completion**: Auto-complete for commands, modes, and models
-- **🎨 Interactive Model Selector**: Numbered menu for quick model switching
-- **💡 Follow-up Suggestions**: Intelligent next-step recommendations after each response
-- **🚀 Improved Router**: Better distinction between knowledge queries and system commands
-- **🔓 Uncensored Creative Mode**: Truly unrestricted output in creative mode
+- **📁 Project-Aware CLI**: Defaults file tools and local data to the current working directory (override with `--project-root` or `PROJECT_ROOT`)
+- **🧾 Code Mode File Writes**: Code mode outputs `FILE:` blocks that the CLI applies directly to disk
+- **🤖 Agentic Mode**: Compact, persistent control loop with one-tool-per-step execution
+- **📁 Agent State on Disk**: `.agent/` state, logs, and scratch outputs for long-running tasks
+- **🧰 Minimal Tool Set**: Added `search` and `write_file` tools for grounded workflows
+- **✅ Dual Execution Modes**: Per-step approvals or auto-run until completion
+- **⚡ Agentic Health Summary**: Fast, deterministic summary for common system health checks
+- **📦 Codebase Summary**: Deterministic overview when reading `README.md`/`AGENTS.md`
+- **🔎 Smarter Search**: `search` now supports file globs like `*.py` and ignores `.agent/` and `.git/`
+- **🧾 JSON Retry Guard**: Agentic loop retries once if model output isn't valid JSON
+- **🧯 No-Match Guard**: Stops repeated empty searches and suggests a real review path
+- **📚 Codebase Bootstrap**: Forces README/AGENTS/CLAUDE read before LLM for repo questions
+- **☕ Multi-Goal Runs**: Chain tasks with “then/and then/after that” and auto-advance goals
+- **✂️ Comma Chaining**: Split multi-goal prompts on commas for fire-and-forget tasks
+- **🧰 Tool Arg Validation**: Rejects malformed tool calls and retries
+- **🧪 Review Bootstrap**: Starts code-review goals with a TODO/FIXME/BUG scan
+- **🧪 Pytest Bootstrap**: Runs pytest once for test-related goals with a summary
+- **🔊 TTS Tool + Service**: Adds a Qwen3-TTS service and `tts` tool (service-first with local fallback)
+- **🔈 TTS Bootstrap**: Detects TTS requests, generates audio, and tracks last output for playback
+- **🔉 TTS Playback Fallbacks**: Remembers last audio path across runs and plays via available system tools (non-blocking)
+- **⏱️ Agentic Timing**: Shows per-step tool/runtime durations in the CLI
+- **🎯 10 Agent Modes**: Expanded mode set including agentic workflows
 
 ## Features
 
 - **Local-First**: Prioritizes local Ollama models, only falling back to external providers when needed
 - **RAG Knowledge Base**: ChromaDB-powered vector store with document ingestion and retrieval
 - **Intelligent Routing**: LangGraph state machine routes queries to retrieval, tools, web search, or direct generation
-- **9 Agent Modes**: Specialized modes (chat, plan, ask, execute, code, image, research, debug, creative)
+- **10 Agent Modes**: Specialized modes (chat, plan, agentic, ask, execute, code, image, research, debug, creative)
+- **Agentic Loop**: Persistent, capped control loop with compact state and strict JSON actions
+- **On-Disk Agent State**: `.agent/` logs and summaries keep prompts tiny
 - **Web Research**: DuckDuckGo search with page content crawling and source synthesis
 - **Document Grading**: LLM-based relevance grading with automatic query rewriting
 - **Multi-Provider Fallback**: Automatic fallback chain (Ollama → Claude → GPT-4 → Gemini → Grok)
 - **Knowledge Base Updates**: Automatically extracts and stores facts from external provider responses
 - **Sandboxed Tool Execution**: Safe bash command execution with validation and approval
+- **TTS Integration**: Qwen3-TTS service with agent tool wrapper (service-first, local fallback)
 - **Context Window Management**: Track token usage and dynamically adjust context window size
-- **Runtime Model Switching**: Switch between Ollama models at runtime with interactive selector
+- **Runtime Model Switching**: Switch between Ollama models at runtime with interactive selector (applies to planner/agentic helpers)
 - **Persistent State**: Remembers last used model and mode between sessions
 - **Tab Completion**: Auto-complete commands, modes, and models
 - **Conversation Memory**: Agent remembers previous exchanges within a session
@@ -74,12 +90,13 @@ User Query
 
 ## Agent Modes
 
-The agent supports 9 specialized modes optimized for different tasks:
+The agent supports 10 specialized modes optimized for different tasks:
 
 | Mode | Purpose | Routing Bias | Temperature | Use Case |
 |------|---------|--------------|-------------|----------|
 | **chat** | General conversation | Balanced | 0.7 | Default mode for mixed tasks |
 | **plan** | Multi-step planning | generate | 0.3 | Breaking down complex tasks |
+| **agentic** | Agentic loop control | Balanced | 0.2 | Multi-step tool orchestration |
 | **ask** | Knowledge retrieval | retrieve | 0.5 | Querying the knowledge base |
 | **execute** | Tool/bash execution | tool | 0.3 | Running system commands |
 | **code** | Programming assistance | generate | 0.3 | Code generation and review |
@@ -133,6 +150,8 @@ python scripts/run.py check
 python scripts/run.py chat
 ```
 
+By default, the CLI treats the current working directory as the project root for file tools and local data storage. Override with `--project-root` or `PROJECT_ROOT`.
+
 Commands in chat:
 - `/model` - Show current model
 - `/model <name>` - Switch to a different model (e.g., `/model deepseek-r1:7b`)
@@ -149,6 +168,8 @@ Commands in chat:
 - `/quit` - Exit
 - `Shift+Tab` - Cycle between modes
 - `!<command>` - Execute shell command directly (e.g., `!ls -la`)
+
+Code mode supports direct file writes: responses formatted with `FILE: path` blocks are applied to disk automatically.
 
 The CLI shows:
 - Current model, mode, and context window on welcome screen
@@ -230,6 +251,7 @@ Key settings:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `PROJECT_ROOT` | repo root (CLI defaults to cwd) | Project root for file tools and local data |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server URL |
 | `OLLAMA_MODEL` | `mistral:7b` | Local LLM model |
 | `OLLAMA_EMBEDDING_MODEL` | `nomic-embed-text` | Embedding model |

@@ -5,6 +5,7 @@ from typing import Any
 
 from langgraph.graph import END, StateGraph
 
+from config.settings import settings
 from src.agent.modes import AgentMode
 from src.agent.nodes import (
     execute_tools,
@@ -16,6 +17,7 @@ from src.agent.nodes import (
     get_selector,
     grade_documents,
     prepare_tool_calls,
+    reset_model_dependent_caches,
     retrieve_documents,
     rewrite_query,
     route_query,
@@ -150,6 +152,11 @@ class Agent:
         self._graph = create_agent_graph()
         self._conversation_history: list = []
         self._current_mode: AgentMode = AgentMode.CHAT
+        self._agentic_approval_mode: str = settings.agentic_default_approval_mode
+        self._agentic_step_approval_callback = None
+        self._agentic_step_result_callback = None
+        self._agentic_bash_approval_callback = None
+        self._agentic_ask_user_callback = None
 
     def query(
         self,
@@ -166,6 +173,16 @@ class Agent:
         Returns:
             Dict with response and metadata
         """
+        if self._current_mode == AgentMode.AGENTIC:
+            return self.run_agentic(
+                task=query,
+                approval_mode=self._agentic_approval_mode,
+                step_approval_callback=self._agentic_step_approval_callback,
+                step_result_callback=self._agentic_step_result_callback,
+                bash_approval_callback=self._agentic_bash_approval_callback,
+                ask_user_callback=self._agentic_ask_user_callback,
+            )
+
         # Create initial state with current mode
         messages = self._conversation_history if include_history else []
         initial_state = create_initial_state(query, messages, mode=self._current_mode)
@@ -204,6 +221,18 @@ class Agent:
         Returns:
             Dict with response and metadata
         """
+        if self._current_mode == AgentMode.AGENTIC:
+            import asyncio
+            return await asyncio.to_thread(
+                self.run_agentic,
+                task=query,
+                approval_mode=self._agentic_approval_mode,
+                step_approval_callback=self._agentic_step_approval_callback,
+                step_result_callback=self._agentic_step_result_callback,
+                bash_approval_callback=self._agentic_bash_approval_callback,
+                ask_user_callback=self._agentic_ask_user_callback,
+            )
+
         messages = self._conversation_history if include_history else []
         initial_state = create_initial_state(query, messages, mode=self._current_mode)
 
@@ -240,6 +269,7 @@ class Agent:
         """
         selector = get_selector()
         selector.set_local_model(model_name)
+        reset_model_dependent_caches()
 
     def get_model(self) -> str:
         """Get the current local model name."""
@@ -267,6 +297,68 @@ class Agent:
             except ValueError:
                 raise ValueError(f"Unknown mode: {mode}")
         self._current_mode = mode
+
+    def set_agentic_approval_mode(self, mode: str) -> None:
+        """Set approval mode for agentic runs."""
+        mode = mode.lower().strip()
+        if mode not in ("step", "auto"):
+            raise ValueError("Approval mode must be 'step' or 'auto'")
+        self._agentic_approval_mode = mode
+
+    def get_agentic_approval_mode(self) -> str:
+        """Get the current approval mode for agentic runs."""
+        return self._agentic_approval_mode
+
+    def set_agentic_callbacks(
+        self,
+        step_approval_callback=None,
+        step_result_callback=None,
+        bash_approval_callback=None,
+        ask_user_callback=None,
+    ) -> None:
+        """Configure callbacks for agentic runs."""
+        self._agentic_step_approval_callback = step_approval_callback
+        self._agentic_step_result_callback = step_result_callback
+        self._agentic_bash_approval_callback = bash_approval_callback
+        self._agentic_ask_user_callback = ask_user_callback
+
+    def run_agentic(
+        self,
+        task: str,
+        approval_mode: str | None = None,
+        step_approval_callback=None,
+        step_result_callback=None,
+        bash_approval_callback=None,
+        ask_user_callback=None,
+        max_steps: int | None = None,
+    ) -> dict[str, Any]:
+        """Run the agentic loop with persistent state."""
+        from src.agent.agentic_loop import AgenticLoop
+
+        loop = AgenticLoop(
+            state_dir=settings.agentic_state_dir,
+            bash_approval_callback=bash_approval_callback,
+            ask_user_callback=ask_user_callback,
+        )
+        result = loop.run(
+            task=task,
+            approval_mode=approval_mode or self._agentic_approval_mode,
+            step_approval_callback=step_approval_callback,
+            step_result_callback=step_result_callback,
+            max_steps=max_steps,
+        )
+        return {
+            "response": result.response,
+            "provider": "agentic",
+            "documents_used": 0,
+            "tool_results": result.tool_results,
+            "mode": AgentMode.AGENTIC.value,
+            "tokens_used": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "steps_executed": result.steps_executed,
+            "stopped_early": result.stopped_early,
+        }
 
     def cycle_mode(self) -> AgentMode:
         """Cycle to the next mode and return it."""

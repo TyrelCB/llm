@@ -302,7 +302,12 @@ Current question: {query}"""
         Args:
             model_name: Name of the model to use (e.g., 'mistral:7b', 'deepseek-r1:7b')
         """
+        settings.ollama_model = model_name
         self._local_llm.set_model(model_name)
+        for provider in self._providers:
+            if provider.name == "local":
+                provider.model = f"ollama/{model_name}"
+                break
 
     def get_current_model(self) -> str:
         """Get the current local model name."""

@@ -1002,3 +1002,9 @@ def get_selector() -> "ProviderSelector":
     This allows external code to access model switching functionality.
     """
     return _get_selector()
+
+
+def reset_model_dependent_caches() -> None:
+    """Clear cached components that bake in model settings."""
+    _get_grader.cache_clear()
+    _get_updater.cache_clear()

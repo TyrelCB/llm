@@ -1,5 +1,6 @@
 """Application settings using Pydantic Settings."""
 
+import os
 from pathlib import Path
 from typing import Literal
 
@@ -55,6 +56,19 @@ class Settings(BaseSettings):
     bash_timeout: int = Field(default=30)
     bash_require_approval: bool = Field(default=True)
 
+    # Agentic loop settings
+    agentic_state_dir: Path = Field(default=Path(__file__).parent.parent / ".agent")
+    agentic_max_steps: int = Field(default=8)
+    agentic_facts_k: int = Field(default=6)
+    agentic_fact_max_chars: int = Field(default=200)
+    agentic_state_max_chars: int = Field(default=1200)
+    agentic_last_result_max_chars: int = Field(default=800)
+    agentic_tool_output_max_chars: int = Field(default=2000)
+    agentic_default_approval_mode: Literal["step", "auto"] = Field(default="step")
+    agentic_repeat_limit: int = Field(default=2)
+    agentic_action_retries: int = Field(default=1)
+    agentic_no_match_limit: int = Field(default=2)
+
     # API settings
     api_host: str = Field(default="0.0.0.0")
     api_port: int = Field(default=8000)
@@ -71,5 +85,41 @@ class Settings(BaseSettings):
     # Web search settings
     searxng_url: str | None = Field(default=None)
 
+    # TTS settings
+    tts_service_url: str = Field(default="http://127.0.0.1:8123")
+    tts_output_dir: Path = Field(default=Path(__file__).parent.parent / "data" / "tts")
+    tts_output_format: Literal["mp3", "wav"] = Field(default="mp3")
+    tts_device: Literal["auto", "cpu", "cuda", "mps"] = Field(default="auto")
+    tts_dtype: Literal["float32", "float16", "bfloat16"] = Field(default="float32")
+    tts_model_custom: str = Field(default="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
+    tts_model_design: str = Field(default="Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign")
+    tts_model_clone: str = Field(default="Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+
 
 settings = Settings()
+
+
+def configure_project_root(root: Path) -> None:
+    """Set project root and rebase derived paths when not explicitly configured."""
+    resolved_root = root.expanduser().resolve()
+    settings.project_root = resolved_root
+
+    data_dir = settings.data_dir
+    if os.getenv("DATA_DIR") is None:
+        data_dir = resolved_root / "data"
+        settings.data_dir = data_dir
+
+    if os.getenv("DOCUMENTS_DIR") is None:
+        settings.documents_dir = data_dir / "documents"
+
+    if os.getenv("CHROMA_DB_PATH") is None:
+        settings.chroma_db_path = data_dir / "chroma_db"
+
+    if os.getenv("AGENTIC_STATE_DIR") is None:
+        settings.agentic_state_dir = resolved_root / ".agent"
+
+    if os.getenv("IMAGE_OUTPUT_DIR") is None:
+        settings.image_output_dir = data_dir / "images"
+
+    if os.getenv("TTS_OUTPUT_DIR") is None:
+        settings.tts_output_dir = data_dir / "tts"
