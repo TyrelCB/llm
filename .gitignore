@@ -42,6 +42,7 @@ env/
 data/chroma_db/
 data/documents/
 data/temp/
+.agent/
 
 # Logs
 *.log

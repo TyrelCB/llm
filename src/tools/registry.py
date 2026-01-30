@@ -1,10 +1,17 @@
 """Tool registration and execution."""
 
 import logging
+import os
+import shutil
+import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
-from src.tools.bash import BashResult, BashTool
+import httpx
+
+from config.settings import settings
+from src.tools.bash import BashTool
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +114,112 @@ class ToolRegistry:
             requires_approval=False,
         )
 
+        # TTS tool (service-first, fallback to local)
+        self.register(
+            name="tts",
+            description="Generate speech audio from text via TTS service",
+            parameters={
+                "mode": {
+                    "type": "string",
+                    "description": "custom_voice|voice_design|voice_clone",
+                    "required": False,
+                    "default": "custom_voice",
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Text to synthesize",
+                    "required": True,
+                },
+                "language": {
+                    "type": "string",
+                    "description": "Language hint (e.g., auto, en, zh)",
+                    "required": False,
+                    "default": "auto",
+                },
+                "speaker": {
+                    "type": "string",
+                    "description": "Speaker preset (custom_voice)",
+                    "required": False,
+                },
+                "instruct": {
+                    "type": "string",
+                    "description": "Voice instruction (custom_voice/voice_design)",
+                    "required": False,
+                },
+                "ref_audio_path": {
+                    "type": "string",
+                    "description": "Reference audio path (voice_clone)",
+                    "required": False,
+                },
+                "ref_text": {
+                    "type": "string",
+                    "description": "Reference transcript (voice_clone)",
+                    "required": False,
+                },
+            },
+            handler=self._tts,
+            requires_approval=False,
+        )
+
+        # Search tool (safe)
+        self.register(
+            name="search",
+            description="Search files using ripgrep (supports glob patterns)",
+            parameters={
+                "query": {
+                    "type": "string",
+                    "description": "Search query for ripgrep",
+                    "required": True,
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Path to search within",
+                    "required": False,
+                    "default": ".",
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Maximum number of matches to return",
+                    "required": False,
+                    "default": 50,
+                },
+            },
+            handler=self._search,
+            requires_approval=False,
+        )
+
+        # File write tool (enabled by default)
+        self.register(
+            name="write_file",
+            description="Write contents to a file",
+            parameters={
+                "path": {
+                    "type": "string",
+                    "description": "Path to the file to write",
+                    "required": True,
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Content to write",
+                    "required": True,
+                },
+                "mode": {
+                    "type": "string",
+                    "description": "Write mode: overwrite or append",
+                    "required": False,
+                    "default": "overwrite",
+                },
+                "create_dirs": {
+                    "type": "boolean",
+                    "description": "Create parent directories if missing",
+                    "required": False,
+                    "default": True,
+                },
+            },
+            handler=self._write_file,
+            requires_approval=False,
+        )
+
     def _execute_bash(self, command: str, timeout: int = 30) -> str:
         """Execute bash command handler."""
         result = self._bash_tool.execute(command, timeout=timeout)
@@ -170,6 +283,238 @@ class ToolRegistry:
             return f"[ERROR] Directory not found: {path}"
         except PermissionError:
             return f"[ERROR] Permission denied: {path}"
+        except Exception as e:
+            return f"[ERROR] {str(e)}"
+
+    def _tts(
+        self,
+        text: str,
+        mode: str = "custom_voice",
+        language: str = "auto",
+        speaker: str | None = None,
+        instruct: str | None = None,
+        ref_audio_path: str | None = None,
+        ref_text: str | None = None,
+    ) -> str:
+        """Generate speech audio via TTS service with local fallback."""
+        payload = {
+            "mode": mode,
+            "text": text,
+            "language": language,
+            "speaker": speaker,
+            "instruct": instruct,
+            "ref_audio_path": ref_audio_path,
+            "ref_text": ref_text,
+        }
+        try:
+            response = httpx.post(
+                f"{settings.tts_service_url}/tts",
+                json=payload,
+                timeout=300,
+            )
+            response.raise_for_status()
+            data = response.json()
+            return (
+                f"[OK] TTS generated: {data.get('path')} "
+                f"(mode={data.get('mode')}, sr={data.get('sample_rate')}, "
+                f"duration_ms={data.get('duration_ms')})"
+            )
+        except Exception as exc:
+            fallback = self._tts_local(payload)
+            if fallback:
+                return fallback
+            return f"[ERROR] TTS service failed: {exc}"
+
+    def _tts_local(self, payload: dict[str, str | None]) -> str | None:
+        """Fallback to in-process Qwen3-TTS if available."""
+        try:
+            import numpy as np
+            import soundfile as sf
+            from qwen_tts import Qwen3TTSModel
+            import torch
+        except Exception:
+            return None
+
+        def resolve_device() -> str:
+            if settings.tts_device != "auto":
+                return settings.tts_device
+            if torch.cuda.is_available():
+                return "cuda"
+            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                return "mps"
+            return "cpu"
+
+        def resolve_dtype(device: str) -> str:
+            if device == "cpu" and settings.tts_dtype in ("float16", "bfloat16"):
+                return "float32"
+            return settings.tts_dtype
+
+        device = resolve_device()
+        dtype = resolve_dtype(device)
+
+        mode = payload.get("mode") or "custom_voice"
+        if mode == "custom_voice":
+            model_id = settings.tts_model_custom
+        elif mode == "voice_design":
+            model_id = settings.tts_model_design
+        else:
+            model_id = settings.tts_model_clone
+
+        model = Qwen3TTSModel.from_pretrained(
+            model_id,
+            device_map=device,
+            dtype=dtype,
+        )
+
+        text = payload.get("text") or ""
+        language = payload.get("language") or "auto"
+        speaker = payload.get("speaker")
+        instruct = payload.get("instruct")
+        ref_audio_path = payload.get("ref_audio_path")
+        ref_text = payload.get("ref_text")
+
+        if mode == "custom_voice":
+            wavs, sr = model.generate_custom_voice(
+                text=text,
+                language=language,
+                speaker=speaker,
+                instruct=instruct,
+            )
+        elif mode == "voice_design":
+            wavs, sr = model.generate_voice_design(
+                text=text,
+                language=language,
+                instruct=instruct,
+            )
+        else:
+            if not ref_audio_path or not ref_text:
+                return "[ERROR] voice_clone requires ref_audio_path and ref_text"
+            wavs, sr = model.generate_voice_clone(
+                text=text,
+                language=language,
+                ref_audio=ref_audio_path,
+                ref_text=ref_text,
+            )
+
+        audio = wavs[0] if isinstance(wavs, (list, tuple)) else wavs
+        output_dir = Path(settings.tts_output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        base_path = output_dir / f"tts_{os.getpid()}_{os.urandom(3).hex()}"
+        wav_path = base_path.with_suffix(".wav")
+        sf.write(wav_path, audio, sr)
+
+        if settings.tts_output_format == "wav":
+            return f"[OK] TTS generated: {wav_path} (mode={mode}, sr={sr})"
+
+        if shutil.which("ffmpeg") is None:
+            return f"[ERROR] ffmpeg not available for mp3 output; wrote {wav_path}"
+
+        mp3_path = base_path.with_suffix(".mp3")
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(wav_path), str(mp3_path)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return f"[ERROR] ffmpeg failed: {result.stderr.strip()}"
+
+        return f"[OK] TTS generated: {mp3_path} (mode={mode}, sr={sr})"
+
+    def _search(self, query: str, path: str = ".", max_results: int = 50) -> str:
+        """Search files using ripgrep or a fallback scan."""
+        search_path = Path(path).expanduser()
+        if not search_path.is_absolute():
+            search_path = (settings.project_root / search_path).resolve()
+
+        if not search_path.exists():
+            return f"[ERROR] Search path not found: {search_path}"
+
+        is_glob = any(ch in query for ch in ("*", "?", "["))
+        if shutil.which("rg"):
+            exclude_globs = ["!**/.git/*", "!**/.agent/*"]
+            if is_glob and " " not in query and "/" not in query:
+                cmd = [
+                    "rg",
+                    "--files",
+                    "--glob",
+                    query,
+                ]
+                for glob in exclude_globs:
+                    cmd.extend(["--glob", glob])
+                cmd.append(str(search_path))
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode not in (0, 1):
+                    return f"[ERROR] rg failed: {result.stderr.strip()}"
+                lines = result.stdout.splitlines()
+                return "\n".join(lines[:max_results]) or "[No matches]"
+
+            cmd = [
+                "rg",
+                "--line-number",
+                "--no-heading",
+                "--max-count",
+                str(max_results),
+            ]
+            for glob in exclude_globs:
+                cmd.extend(["--glob", glob])
+            cmd.extend([query, str(search_path)])
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode not in (0, 1):
+                return f"[ERROR] rg failed: {result.stderr.strip()}"
+            lines = result.stdout.splitlines()
+            return "\n".join(lines[:max_results]) or "[No matches]"
+
+        matches: list[str] = []
+        for root, dirs, files in os.walk(search_path):
+            dirs[:] = [d for d in dirs if d not in {".git", ".agent"}]
+            for name in files:
+                file_path = Path(root) / name
+                try:
+                    if is_glob:
+                        from fnmatch import fnmatch
+                        if fnmatch(name, query):
+                            matches.append(str(file_path))
+                            if len(matches) >= max_results:
+                                return "\n".join(matches)
+                        continue
+                    with file_path.open("r", encoding="utf-8") as handle:
+                        for idx, line in enumerate(handle, 1):
+                            if query in line:
+                                matches.append(f"{file_path}:{idx}:{line.rstrip()}")
+                                if len(matches) >= max_results:
+                                    return "\n".join(matches)
+                except (UnicodeDecodeError, PermissionError):
+                    continue
+
+        return "\n".join(matches) or "[No matches]"
+
+    def _write_file(
+        self,
+        path: str,
+        content: str,
+        mode: str = "overwrite",
+        create_dirs: bool = True,
+    ) -> str:
+        """Write file contents with path safety checks."""
+        target = Path(path).expanduser()
+        if not target.is_absolute():
+            target = (settings.project_root / target).resolve()
+
+        root = settings.project_root.resolve()
+        if root not in target.parents and target != root:
+            return f"[ERROR] Path outside project root: {target}"
+
+        if mode not in ("overwrite", "append"):
+            return f"[ERROR] Invalid mode: {mode}. Use 'overwrite' or 'append'."
+
+        if create_dirs:
+            target.parent.mkdir(parents=True, exist_ok=True)
+
+        write_mode = "a" if mode == "append" else "w"
+        try:
+            with target.open(write_mode, encoding="utf-8") as handle:
+                handle.write(content)
+            return f"[OK] Wrote {len(content)} chars to {target}"
         except Exception as e:
             return f"[ERROR] {str(e)}"
 
