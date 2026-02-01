@@ -2,10 +2,14 @@
 
 A local-first LLM agent with RAG-based knowledge base, tool execution, and intelligent fallback to external providers.
 
-## What's New in 0.8.7
+## What's New in 0.8.10
 
 - **📁 Project-Aware CLI**: Defaults file tools and local data to the current working directory (override with `--project-root` or `PROJECT_ROOT`)
 - **🧾 Code Mode File Writes**: Code mode outputs `FILE:` blocks that the CLI applies directly to disk
+- **📄 Cross-Mode File Writes**: File-create requests in other modes use the code-mode prompt and apply `FILE:` blocks automatically
+- **⚙️ Agentic Auto Mode**: Agentic runs always execute in auto mode without approval prompts (no shift+tab interruption)
+- **📥 /ingest Command**: Ingest a file, directory, or glob of files into the KB from chat
+- **🧩 Ingest Dedup Fix**: Avoid duplicate IDs when ingesting identical chunks in a single batch
 - **🤖 Agentic Mode**: Compact, persistent control loop with one-tool-per-step execution
 - **📁 Agent State on Disk**: `.agent/` state, logs, and scratch outputs for long-running tasks
 - **🧰 Minimal Tool Set**: Added `search` and `write_file` tools for grounded workflows
@@ -162,6 +166,7 @@ Commands in chat:
 - `/context` - Show current context window size
 - `/context <size>` - Set context window (e.g., `/context 16384`)
 - `/plan [task]` - Enter planning mode for multi-step tasks
+- `/ingest <path>` - Ingest a file or directory into the knowledge base
 - `/clear` - Clear conversation history
 - `/stats` - Show knowledge base, model, and context stats
 - `/help` - Show help

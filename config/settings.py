@@ -64,7 +64,7 @@ class Settings(BaseSettings):
     agentic_state_max_chars: int = Field(default=1200)
     agentic_last_result_max_chars: int = Field(default=800)
     agentic_tool_output_max_chars: int = Field(default=2000)
-    agentic_default_approval_mode: Literal["step", "auto"] = Field(default="step")
+    agentic_default_approval_mode: Literal["step", "auto"] = Field(default="auto")
     agentic_repeat_limit: int = Field(default=2)
     agentic_action_retries: int = Field(default=1)
     agentic_no_match_limit: int = Field(default=2)

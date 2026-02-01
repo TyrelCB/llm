@@ -3,6 +3,7 @@
 import logging
 import os
 import re
+import shlex
 import sys
 import time
 import threading
@@ -28,7 +29,7 @@ if "chat" in sys.argv:
 from config.settings import settings, configure_project_root
 from src.agent.modes import AgentMode, get_mode_config, get_next_mode, list_modes, get_mode_by_name
 
-__version__ = "0.8.7"
+__version__ = "0.8.11"
 logger = logging.getLogger(__name__)
 
 
@@ -239,6 +240,23 @@ def _extract_file_blocks(response: str) -> list[dict[str, str]]:
     return blocks
 
 
+def _looks_like_file_request(query: str) -> bool:
+    """Heuristic to detect file creation/update intents."""
+    lowered = query.lower()
+    if not any(
+        keyword in lowered
+        for keyword in ("create", "write", "update", "edit", "add", "generate", "make")
+    ):
+        return False
+    if "docs/" in lowered or "doc/" in lowered:
+        return True
+    if ".md" in lowered or "markdown" in lowered:
+        return True
+    if re.search(r"\b[\w\-/]+\.[a-z0-9]{1,5}\b", lowered):
+        return True
+    return False
+
+
 def _apply_file_blocks(blocks: list[dict[str, str]]) -> list[dict[str, str | bool]]:
     """Apply file blocks using the write_file tool."""
     if not blocks:
@@ -276,6 +294,46 @@ def _render_apply_summary(results: list[dict[str, str | bool]]) -> str:
         for item in failed:
             lines.append(f"- `{item['path']}`: {item['message']}")
     return "\n".join(lines)
+
+
+def _merge_ingest_stats(stats_list: list) -> object:
+    """Merge multiple ingestion stats objects into one."""
+    from src.ingestion.pipeline import IngestionStats
+
+    merged = IngestionStats(
+        files_processed=0,
+        documents_loaded=0,
+        chunks_created=0,
+        chunks_stored=0,
+        errors=[],
+    )
+    for stats in stats_list:
+        merged.files_processed += stats.files_processed
+        merged.documents_loaded += stats.documents_loaded
+        merged.chunks_created += stats.chunks_created
+        merged.chunks_stored += stats.chunks_stored
+        merged.errors.extend(stats.errors or [])
+    return merged
+
+
+def _print_ingest_stats(stats: object) -> None:
+    """Print ingestion statistics."""
+    table = Table(title="Ingestion Results")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", style="green")
+
+    table.add_row("Files Processed", str(getattr(stats, "files_processed", 0)))
+    table.add_row("Documents Loaded", str(getattr(stats, "documents_loaded", 0)))
+    table.add_row("Chunks Created", str(getattr(stats, "chunks_created", 0)))
+    table.add_row("Chunks Stored", str(getattr(stats, "chunks_stored", 0)))
+
+    console.print(table)
+
+    errors = getattr(stats, "errors", []) or []
+    if errors:
+        console.print("\n[yellow]Errors:[/yellow]")
+        for error in errors:
+            console.print(f"  - {error}")
 
 
 def _get_mode_color(mode: AgentMode) -> str:
@@ -342,47 +400,19 @@ def _load_state() -> dict:
     return {}
 
 
-def _prompt_agentic_approval_mode(current: str | None = None) -> str:
-    """Prompt for agentic approval mode."""
-    default = current or settings.agentic_default_approval_mode
-    return Prompt.ask(
-        "[bold cyan]Agentic execution mode[/bold cyan] ([green]step[/green]/[green]auto[/green])",
-        choices=["step", "auto"],
-        default=default,
-    )
-
-
 def _agentic_step_approval(action: dict) -> bool:
-    """Request per-step approval for agentic actions."""
-    action_spec = action.get("action") or {}
-    tool = action_spec.get("tool", "unknown")
-    args = action_spec.get("args", {})
-    details = ""
-    if tool == "bash":
-        details = f" command={args.get('command', '')}"
-    elif tool == "read_file":
-        details = f" path={args.get('path', '')}"
-    elif tool == "write_file":
-        details = f" path={args.get('path', '')}"
-    elif tool == "search":
-        details = f" query={args.get('query', '')}"
-    elif tool == "ask_user":
-        details = f" question={args.get('question', '')}"
-    console.print(f"[yellow]Agentic step request:[/yellow] {tool}{details}")
-    choice = Prompt.ask("[bold cyan]Execute this step?[/bold cyan] [y/n]", default="y").strip().lower()
-    return choice == "y" or choice == ""
+    """Auto-approve agentic actions."""
+    return True
 
 
 def _agentic_bash_approval(command: str) -> bool:
-    """Request approval for potentially dangerous bash commands."""
-    console.print(f"[yellow]Bash approval required:[/yellow] {command}")
-    choice = Prompt.ask("[bold cyan]Approve command?[/bold cyan] [y/n]", default="n").strip().lower()
-    return choice == "y"
+    """Auto-approve bash commands for agentic runs."""
+    return True
 
 
 def _agentic_ask_user(question: str) -> str:
-    """Prompt user for missing input during agentic runs."""
-    return Prompt.ask(f"[bold yellow]Agent needs info:[/bold yellow] {question}")
+    """Agentic runs should not prompt for user input."""
+    return ""
 
 
 def _agentic_step_result(action: dict, result: dict) -> None:
@@ -438,53 +468,150 @@ def _create_prompt_session(agent):
         from prompt_toolkit import PromptSession
         from prompt_toolkit.key_binding import KeyBindings
         from prompt_toolkit.keys import Keys
-        from prompt_toolkit.completion import WordCompleter
+        from prompt_toolkit.completion import Completer, Completion
 
-        # Create completer for commands and common terms
-        commands = [
-            "/quit", "/exit", "/q", "/clear", "/help", "/stats",
-            "/model", "/models", "/mode", "/modes", "/plan", "/context"
-        ]
-
-        # Add mode names
-        mode_names = [f"/mode {mode.value}" for mode in AgentMode]
-
-        # Get available models for completion
+        complete_style = None
+        completion_style = None
         try:
-            model_names = [f"/model {m}" for m in agent.list_models()]
-        except:
-            model_names = []
+            from prompt_toolkit.completion import CompleteStyle
+            from prompt_toolkit.styles import Style
 
-        completer_words = commands + mode_names + model_names
-        completer = WordCompleter(
-            completer_words,
-            ignore_case=True,
-            sentence=True,
-            match_middle=True,
-        )
+            complete_style = CompleteStyle.MULTI_COLUMN
+            completion_style = Style.from_dict(
+                {
+                    "completion": "fg:#7a7a7a",
+                    "completion.match": "fg:#d2d2d2",
+                    "completion.current": "bg:#444444 fg:#ffffff",
+                    "completion.menu.completion": "fg:#7a7a7a",
+                    "completion.menu.completion.current": "bg:#444444 fg:#ffffff",
+                    "completion.scrollbar": "bg:#333333",
+                    "completion.scrollbar.arrow": "fg:#aaaaaa bg:#333333",
+                }
+            )
+        except Exception:
+            complete_style = None
+            completion_style = None
+
+        command_meta = {
+            "/clear": "Clear conversation history",
+            "/help": "Show help and command reference",
+            "/stats": "Show KB stats, model, and context",
+            "/model": "Show current model or switch: /model <name>",
+            "/models": "List available Ollama models",
+            "/mode": "Show or set mode: /mode <name>",
+            "/modes": "List available modes",
+            "/context": "Show or set context window: /context <size>",
+            "/plan": "Plan and execute a multi-step task",
+            "/ingest": "Ingest files/dirs/globs into the KB",
+            "/quit": "Exit the chat",
+            "/exit": "Exit the chat",
+            "/q": "Exit the chat",
+        }
+
+        mode_meta = {
+            mode.value: get_mode_config(mode).description for mode in AgentMode
+        }
+
+        ingest_flags = {
+            "--recursive": "Recurse into subdirectories (default)",
+            "--no-recursive": "Only ingest the top-level directory",
+            "--exclude": "Exclude matching paths (repeatable)",
+            "--glob": "Ingest files matching glob pattern",
+            "--text": "Ingest raw text content",
+            "--source": "Source label for --text",
+        }
+
+        class SlashCompleter(Completer):
+            def __init__(self) -> None:
+                try:
+                    self._models = agent.list_models()
+                except Exception:
+                    self._models = []
+
+            def _get_prefix(self, document) -> tuple[str, list[str], bool]:
+                text = document.text_before_cursor
+                if not text.startswith("/"):
+                    return "", [], False
+                parts = text.split()
+                if not parts:
+                    return "", [], False
+                has_trailing_space = text.endswith(" ")
+                current = "" if has_trailing_space else parts[-1]
+                return current, parts, has_trailing_space
+
+            def get_completions(self, document, complete_event):
+                prefix, parts, has_trailing_space = self._get_prefix(document)
+                if not parts:
+                    return
+
+                # Command name completion
+                if len(parts) == 1 and not has_trailing_space:
+                    for cmd, meta in command_meta.items():
+                        if cmd.startswith(prefix):
+                            yield Completion(
+                                cmd,
+                                start_position=-len(prefix),
+                                display=cmd,
+                                display_meta=meta,
+                            )
+                    return
+
+                command = parts[0]
+                if command == "/mode":
+                    for name, meta in mode_meta.items():
+                        if name.startswith(prefix):
+                            yield Completion(
+                                name,
+                                start_position=-len(prefix),
+                                display=name,
+                                display_meta=meta,
+                            )
+                    return
+
+                if command == "/model":
+                    for name in self._models:
+                        if name.startswith(prefix):
+                            yield Completion(
+                                name,
+                                start_position=-len(prefix),
+                                display=name,
+                            )
+                    return
+
+                if command == "/ingest":
+                    if prefix.startswith("-") or (has_trailing_space or prefix == ""):
+                        for flag, meta in ingest_flags.items():
+                            if flag.startswith(prefix):
+                                yield Completion(
+                                    flag,
+                                    start_position=-len(prefix),
+                                    display=flag,
+                                    display_meta=meta,
+                                )
+
+        completer = SlashCompleter()
 
         bindings = KeyBindings()
-
-        # Store a flag for mode switch handling
-        mode_switched = {"value": False}
 
         @bindings.add(Keys.BackTab)  # Shift+Tab
         def _(event):
             """Cycle to next mode on Shift+Tab."""
             new_mode = agent.cycle_mode()
-            mode_config = get_mode_config(new_mode)
-            color = _get_mode_color(new_mode)
             # Save state
             _save_state(agent.get_model(), new_mode.value)
-            # Set flag and exit with special marker
-            mode_switched["value"] = True
             event.app.exit(result='__MODE_SWITCH__')
 
-        session = PromptSession(
-            key_bindings=bindings,
-            completer=completer,
-            complete_while_typing=False,  # Only complete on Tab
-        )
+        session_kwargs = {
+            "key_bindings": bindings,
+            "completer": completer,
+            "complete_while_typing": True,
+        }
+        if complete_style is not None:
+            session_kwargs["complete_style"] = complete_style
+        if completion_style is not None:
+            session_kwargs["style"] = completion_style
+
+        session = PromptSession(**session_kwargs)
         return session
     except ImportError:
         return None
@@ -597,8 +724,7 @@ def chat(
             logger.debug(f"Failed to restore model: {e}")
 
     if not query and agent.get_mode() == AgentMode.AGENTIC:
-        approval_mode = _prompt_agentic_approval_mode(agent.get_agentic_approval_mode())
-        agent.set_agentic_approval_mode(approval_mode)
+        agent.set_agentic_approval_mode("auto")
 
     if query:
         # Single query mode
@@ -635,9 +761,10 @@ def chat(
             "  /mode <name> - Switch to specific mode\n"
             "  /modes       - List all available modes\n\n"
             "Agentic:\n"
-            "  /mode agentic - Persistent multi-step loop (step or auto)\n\n"
+            "  /mode agentic - Persistent multi-step loop (auto-run)\n\n"
             "Commands:\n"
             "  /plan [task]     - Plan and execute a multi-step task\n"
+            "  /ingest <path>   - Ingest a file or directory into the KB\n"
             "  /model           - Show current model\n"
             "  /model <name>    - Switch to a different model\n"
             "  /models          - List available Ollama models\n"
@@ -678,8 +805,7 @@ def chat(
             # Handle mode switch special case
             if user_input == '__MODE_SWITCH__':
                 if agent.get_mode() == AgentMode.AGENTIC:
-                    approval_mode = _prompt_agentic_approval_mode(agent.get_agentic_approval_mode())
-                    agent.set_agentic_approval_mode(approval_mode)
+                    agent.set_agentic_approval_mode("auto")
                 continue
 
             if not user_input.strip():
@@ -883,10 +1009,10 @@ def _process_query(agent, query: str) -> None:
 
     response_text = result["response"]
 
-    # Auto-apply code-mode file blocks
-    if agent.get_mode() == AgentMode.CODE and result.get("provider") != "shell":
+    # Auto-apply file blocks when the request implies file edits
+    if result.get("provider") != "shell":
         file_blocks = _extract_file_blocks(response_text)
-        if file_blocks:
+        if file_blocks and _looks_like_file_request(query):
             apply_results = _apply_file_blocks(file_blocks)
             response_text = _render_apply_summary(apply_results)
 
@@ -1317,6 +1443,121 @@ def _handle_command(command: str, agent) -> bool:
         console.print(f"Context window: {agent.get_context_window():,} tokens")
         return True
 
+    if cmd_lower == "/ingest" or cmd_lower.startswith("/ingest "):
+        args = shlex.split(cmd)
+        recursive = True
+        exclude: list[str] = []
+        glob: str | None = None
+        text_content: str | None = None
+        source = "cli-input"
+        path_arg: str | None = None
+
+        idx = 1
+        while idx < len(args):
+            token = args[idx]
+            if token in ("--recursive", "-r"):
+                recursive = True
+                idx += 1
+                continue
+            if token in ("--no-recursive", "-R"):
+                recursive = False
+                idx += 1
+                continue
+            if token in ("--exclude", "-e"):
+                if idx + 1 >= len(args):
+                    console.print("[yellow]Missing value for --exclude[/yellow]")
+                    return True
+                exclude.append(args[idx + 1])
+                idx += 2
+                continue
+            if token == "--glob":
+                if idx + 1 >= len(args):
+                    console.print("[yellow]Missing value for --glob[/yellow]")
+                    return True
+                glob = args[idx + 1]
+                idx += 2
+                continue
+            if token == "--text":
+                if idx + 1 >= len(args):
+                    console.print("[yellow]Missing value for --text[/yellow]")
+                    return True
+                text_content = args[idx + 1]
+                idx += 2
+                continue
+            if token == "--source":
+                if idx + 1 >= len(args):
+                    console.print("[yellow]Missing value for --source[/yellow]")
+                    return True
+                source = args[idx + 1]
+                idx += 2
+                continue
+
+            if path_arg is None:
+                path_arg = token
+                idx += 1
+                continue
+
+            console.print(f"[yellow]Unexpected argument: {token}[/yellow]")
+            return True
+
+        from src.ingestion import IngestionPipeline
+
+        pipeline = IngestionPipeline()
+
+        if text_content is not None:
+            stats = pipeline.ingest_text(text_content, source=source)
+            _print_ingest_stats(stats)
+            return True
+
+        if not path_arg and not glob:
+            console.print("[yellow]Usage:[/yellow] /ingest <path> [--recursive|--no-recursive] [--exclude PATTERN]")
+            console.print("[yellow]   or:[/yellow] /ingest --glob \"<pattern>\" [path]")
+            console.print("[yellow]   or:[/yellow] /ingest --text \"<content>\" [--source name]")
+            console.print("[yellow]Examples:[/yellow]")
+            console.print("  /ingest README.md")
+            console.print("  /ingest docs --recursive")
+            console.print("  /ingest --glob \"*.md\" .")
+            console.print("  /ingest --text \"notes\" --source scratchpad")
+            return True
+
+        base_path = Path(path_arg) if path_arg else settings.project_root
+        if not base_path.is_absolute():
+            base_path = (settings.project_root / base_path).resolve()
+
+        if glob:
+            if not base_path.exists():
+                console.print(f"[red]Error:[/red] Path not found: {base_path}")
+                return True
+            matches = [p for p in base_path.rglob(glob) if p.is_file()]
+            if not matches:
+                console.print(f"[yellow]No files matched pattern '{glob}' under {base_path}[/yellow]")
+                return True
+            stats_list = [pipeline.ingest_file(path) for path in matches]
+            merged = _merge_ingest_stats(stats_list)
+            _print_ingest_stats(merged)
+            return True
+
+        if not base_path.exists():
+            console.print(f"[red]Error:[/red] Path not found: {base_path}")
+            return True
+
+        if base_path.is_file():
+            stats = pipeline.ingest_file(base_path)
+            _print_ingest_stats(stats)
+            return True
+
+        if base_path.is_dir():
+            stats = pipeline.ingest_directory(
+                base_path,
+                recursive=recursive,
+                exclude_patterns=exclude or None,
+            )
+            _print_ingest_stats(stats)
+            return True
+
+        console.print(f"[red]Error:[/red] Unsupported path: {base_path}")
+        return True
+
     if cmd_lower == "/context":
         current_ctx = agent.get_context_window()
         console.print(f"Current context window: [cyan]{current_ctx:,}[/cyan] tokens")
@@ -1373,8 +1614,7 @@ def _handle_command(command: str, agent) -> bool:
             mode_color = _get_mode_color(mode_enum)
             console.print(f"[{mode_color}]→ {mode_enum.value}[/{mode_color}] [dim]{mode_config.description}[/dim]")
             if mode_enum == AgentMode.AGENTIC:
-                approval_mode = _prompt_agentic_approval_mode(agent.get_agentic_approval_mode())
-                agent.set_agentic_approval_mode(approval_mode)
+                agent.set_agentic_approval_mode("auto")
             # Save state
             _save_state(agent.get_model(), mode_enum.value)
         else:
@@ -1417,6 +1657,7 @@ def _handle_command(command: str, agent) -> bool:
                 "  /modes         - List all available modes\n\n"
                 "Available commands:\n"
                 "  /plan [task]     - Enter planning mode to create and execute a plan\n"
+                "  /ingest <path>   - Ingest a file or directory into the KB\n"
                 "  /model           - Show current model\n"
                 "  /model <name>    - Switch to a different model\n"
                 "  /models          - List available Ollama models\n"

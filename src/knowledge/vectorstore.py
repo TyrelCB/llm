@@ -54,10 +54,11 @@ class VectorStore:
             List of document IDs that were added
         """
         added_ids: list[str] = []
+        seen_ids: set[str] = set()
 
         for i in range(0, len(documents), batch_size):
             batch = documents[i : i + batch_size]
-            texts = [doc.page_content for doc in batch]
+            texts: list[str] = []
             metadatas = []
             ids = []
 
@@ -66,9 +67,14 @@ class VectorStore:
                 doc_id = f"doc_{content_hash}"
 
                 # Check for duplicates
+                if doc_id in seen_ids:
+                    logger.debug(f"Skipping duplicate in batch: {doc_id}")
+                    continue
+
                 existing = self._collection.get(ids=[doc_id])
                 if existing["ids"]:
                     logger.debug(f"Skipping duplicate document: {doc_id}")
+                    seen_ids.add(doc_id)
                     continue
 
                 metadata = {
@@ -76,20 +82,22 @@ class VectorStore:
                     "content_hash": content_hash,
                     "added_at": datetime.now().isoformat(),
                 }
+                texts.append(doc.page_content)
                 metadatas.append(metadata)
                 ids.append(doc_id)
+                seen_ids.add(doc_id)
 
             if not ids:
                 continue
 
             # Generate embeddings
-            embeddings = self._embeddings.embed_documents(texts[: len(ids)])
+            embeddings = self._embeddings.embed_documents(texts)
 
             # Add to ChromaDB
             self._collection.add(
                 ids=ids,
                 embeddings=embeddings,
-                documents=texts[: len(ids)],
+                documents=texts,
                 metadatas=metadatas,
             )
             added_ids.extend(ids)

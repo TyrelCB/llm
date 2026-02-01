@@ -42,3 +42,22 @@
 - [x] Require FILE blocks in code mode for file edits.
 - [x] Auto-apply FILE blocks in the CLI.
 - [x] Update docs for code mode file writes.
+
+## Agentic Auto + Ingest Command (Jan 2026)
+- [x] Force agentic runs to auto mode with no prompts.
+- [x] Remove ask_user tool usage from agentic loop.
+- [x] Add /ingest command for file/dir/glob KB ingestion.
+- [x] Update docs and version for behavior changes.
+- [x] Remove any remaining agentic approval prompts on mode switches.
+
+## Mode Flow Docs (Jan 2026)
+- [x] Add per-mode ASCII flow diagrams under docs/modes.
+- [x] Include an index README for mode docs.
+
+## Ingestion Dedup Fix (Jan 2026)
+- [x] Prevent duplicate IDs within a single add_documents batch.
+- [x] Update docs and version for behavior change.
+
+## Cross-Mode File Writes (Jan 2026)
+- [x] Detect file-create requests outside code mode.
+- [x] Apply code-mode prompt and file block writes automatically.

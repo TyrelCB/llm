@@ -114,6 +114,10 @@ The agent can request clarification when queries are ambiguous. Responses starti
   - Runtime model switching: `/model <name>` or `--model` flag (applies to planner/agentic helpers)
   - Project root defaults to cwd for CLI; override with `--project-root` or `PROJECT_ROOT`
   - Code mode auto-applies `FILE:` blocks to disk
+  - File-create requests in other modes use the code-mode prompt and apply `FILE:` blocks
+  - Agentic mode runs in auto mode with no approval prompts
+  - `/ingest` ingests files/directories into the KB from the CLI
+  - Ingestion dedupes identical chunks within a batch to avoid duplicate IDs
   - Mode cycling: `Shift+Tab` or `/mode <name>`
   - Shell commands: `!command` prefix for direct execution
   - Plan mode: `/plan [task]` for multi-step task planning

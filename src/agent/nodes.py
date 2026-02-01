@@ -346,7 +346,27 @@ def generate_local(state: AgentStateDict) -> AgentStateDict:
         mode_config = get_mode_config(mode_enum)
         custom_system_prompt = mode_config.system_prompt_modifier
     except ValueError:
+        mode_enum = AgentMode.CHAT
         custom_system_prompt = None
+
+    # If the user asks to create/update files outside code mode, force code prompt.
+    def looks_like_file_request(text: str) -> bool:
+        lowered = text.lower()
+        if not any(
+            keyword in lowered
+            for keyword in ("create", "write", "update", "edit", "add", "generate", "make")
+        ):
+            return False
+        if "docs/" in lowered or "doc/" in lowered:
+            return True
+        if ".md" in lowered or "markdown" in lowered:
+            return True
+        import re
+        return bool(re.search(r"\b[\w\-/]+\.[a-z0-9]{1,5}\b", lowered))
+
+    if mode_enum != AgentMode.CODE and looks_like_file_request(query):
+        code_config = get_mode_config(AgentMode.CODE)
+        custom_system_prompt = code_config.system_prompt_modifier
 
     result = _get_selector().generate_with_context(
         query=query,

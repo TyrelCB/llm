@@ -77,6 +77,7 @@ class AgenticLoop:
         step_result_callback: StepResultCallback | None = None,
         max_steps: int | None = None,
     ) -> AgenticResult:
+        approval_mode = "auto"
         state = self._init_state(task)
         max_steps = max_steps or settings.agentic_max_steps
         tool_results: list[dict[str, Any]] = []
@@ -141,20 +142,6 @@ class AgenticLoop:
             result["summary"] = summary
             self._maybe_store_tts_path(state, action, result)
             self._update_no_match_count(state, action, result)
-            if result.get("tool") == "ask_user" and not result.get("success", False):
-                state["status"] = "needs_user_input"
-                state["last_action"] = self._format_action(action)
-                state["last_result_summary"] = summary
-                self._save_state(state)
-                self._log_step(state, action, result)
-                if step_result_callback:
-                    step_result_callback(action, result)
-                return AgenticResult(
-                    response=result.get("output", ""),
-                    tool_results=tool_results,
-                    steps_executed=step_index,
-                    stopped_early=True,
-                )
             result["step_duration_ms"] = int((time.time() - step_start) * 1000)
             state["last_action"] = self._format_action(action)
             state["last_result_summary"] = summary
@@ -372,7 +359,7 @@ class AgenticLoop:
             "If system state or files are involved, prefer bash/search/read_file first. "
             "For system health checks, prefer bash: uptime, df -h, free -h, ps. "
             "For codebase overviews, read README.md and AGENTS.md (if present) first. "
-            "The tool name must be one of: bash, search, read_file, write_file, list_dir, ask_user. "
+            "The tool name must be one of: bash, search, read_file, write_file, list_dir, tts. "
             "Tool arguments must be JSON objects, not tool-call strings. "
             "If enough information is available, set status to 'final' and fill final. "
             "Never include markdown or explanations outside JSON."
@@ -509,8 +496,6 @@ class AgenticLoop:
             if not self._is_valid_arg_string(args.get("path"), allow_braces=False):
                 return False
             return isinstance(args.get("content"), str)
-        if tool == "ask_user":
-            return isinstance(args.get("question"), str) and bool(args.get("question"))
         return True
 
     @staticmethod
@@ -522,7 +507,7 @@ class AgenticLoop:
         return True
 
     def _allowed_tools(self) -> set[str]:
-        return {tool.name for tool in self._tool_registry.list_tools()} | {"ask_user"}
+        return {tool.name for tool in self._tool_registry.list_tools()}
 
     def _maybe_store_tts_path(
         self,
@@ -541,17 +526,6 @@ class AgenticLoop:
                     clean_path = path.split(" (", 1)[0].strip()
                     state["last_tts_path"] = clean_path
             return
-        if tool == "ask_user":
-            question = self._safe_text(action_spec.get("args", {}).get("question", ""))
-            if "audio file path" in question.lower():
-                candidate = self._extract_audio_path(output)
-                if candidate:
-                    state["last_tts_path"] = candidate
-                    state["open_questions"] = [
-                        item
-                        for item in state.get("open_questions", [])
-                        if "audio file path" not in item.lower()
-                    ]
 
     @staticmethod
     def _extract_quoted_text(text: str) -> str | None:
@@ -623,24 +597,18 @@ class AgenticLoop:
                 }
             if play_path:
                 return {
-                    "status": "continue",
-                    "thought": "Need a valid audio file path before playback.",
-                    "action": {
-                        "tool": "ask_user",
-                        "args": {
-                            "question": (
-                                f"I couldn't find '{play_path}'. "
-                                "What is the audio file path to play?"
-                            )
-                        },
-                    },
-                    "state_update": {"open_questions_add": ["Need audio file path to play"]},
+                    "status": "final",
+                    "final": (
+                        f"I couldn't find '{play_path}'. "
+                        "Provide a valid audio file path and try again."
+                    ),
                 }
             return {
-                "status": "continue",
-                "thought": "Need the path to the audio file before playback.",
-                "action": {"tool": "ask_user", "args": {"question": "What is the audio file path to play?"}},
-                "state_update": {"open_questions_add": ["Need audio file path to play"]},
+                "status": "final",
+                "final": (
+                    "Audio playback requires a valid file path. "
+                    "Provide the path to an existing audio file and try again."
+                ),
             }
 
         if "tts" in goal or "text to speech" in goal or "speech" in goal:
@@ -711,24 +679,6 @@ class AgenticLoop:
         tool_args = action_spec.get("args", {})
         if not isinstance(tool_args, dict):
             tool_args = {}
-
-        if tool_name == "ask_user":
-            question = self._safe_text(tool_args.get("question", ""))
-            if self._ask_user_callback:
-                answer = self._ask_user_callback(question)
-                return {
-                    "tool": tool_name,
-                    "args": tool_args,
-                    "output": answer,
-                    "success": True,
-                }
-            return {
-                "tool": tool_name,
-                "args": tool_args,
-                "output": f"CLARIFY: {question}",
-                "success": False,
-                "error": "ask_user unavailable",
-            }
 
         if not tool_name:
             return {
@@ -817,7 +767,6 @@ class AgenticLoop:
             "write_file(path, content, mode='overwrite', create_dirs=true) - write file",
             "list_dir(path) - list directory contents",
             "tts(mode, text, language='auto', speaker=None, instruct=None, ref_audio_path=None, ref_text=None) - text to speech",
-            "ask_user(question) - request missing info",
         ]
         return "\n".join(f"{idx + 1}. {tool}" for idx, tool in enumerate(tool_specs))
 
@@ -856,17 +805,12 @@ class AgenticLoop:
         return f"{tool}:{args_text}" if tool else ""
 
     def _repeat_breaker_action(self, state: dict[str, Any]) -> dict[str, Any]:
-        question = (
-            "I keep repeating the same step. What should I check next or "
-            "which tool should I use?"
-        )
         return {
-            "status": "continue",
-            "thought": "Detected a loop; ask for guidance.",
-            "action": {"tool": "ask_user", "args": {"question": question}},
-            "state_update": {
-                "open_questions_add": [question],
-            },
+            "status": "final",
+            "final": (
+                "I keep repeating the same step and cannot proceed automatically. "
+                "Please provide a more specific task or direct next action."
+            ),
         }
 
     def _maybe_auto_finalize(

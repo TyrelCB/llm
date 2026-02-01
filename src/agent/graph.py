@@ -300,10 +300,7 @@ class Agent:
 
     def set_agentic_approval_mode(self, mode: str) -> None:
         """Set approval mode for agentic runs."""
-        mode = mode.lower().strip()
-        if mode not in ("step", "auto"):
-            raise ValueError("Approval mode must be 'step' or 'auto'")
-        self._agentic_approval_mode = mode
+        self._agentic_approval_mode = "auto"
 
     def get_agentic_approval_mode(self) -> str:
         """Get the current approval mode for agentic runs."""
@@ -342,7 +339,7 @@ class Agent:
         )
         result = loop.run(
             task=task,
-            approval_mode=approval_mode or self._agentic_approval_mode,
+            approval_mode="auto",
             step_approval_callback=step_approval_callback,
             step_result_callback=step_result_callback,
             max_steps=max_steps,
